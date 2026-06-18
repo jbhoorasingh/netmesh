@@ -10,5 +10,6 @@
 netmesh-admin.json
 # Release build output
 /dist/
-# Local editor / tooling config
-.claude/
+# Local Claude Code / tooling config (shared .claude/settings.json IS tracked)
+.claude/launch.json
+.claude/settings.local.json

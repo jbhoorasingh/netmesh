@@ -314,6 +314,52 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o netmesh_linux_arm64 ./cmd/netm
 (The data-plane `SO_REUSEPORT` socket option is selected per-OS via build tags —
 `reuseport_unix.go` / `reuseport_windows.go` — so Windows builds compile too.)
 
+## Cloud / Claude Code dev environment
+
+The repo ships a Dev Container (`.devcontainer/devcontainer.json`) that
+provisions the Go 1.26 toolchain, the [Claude Code](https://code.claude.com)
+CLI, and forwards the NetMesh UI ports. One definition serves three workflows:
+
+**GoLand (JetBrains).** Develop inside the container:
+
+1. Open the project → **Start Dev Container inside IDE** (or connect via
+   [JetBrains Gateway](https://www.jetbrains.com/help/go/connect-to-devcontainer.html));
+   GoLand runs its backend in the container.
+2. Install the **Claude Code [Beta]** plugin from the JetBrains Marketplace. It
+   invokes the `claude` CLI that the container already has on `PATH` (launch with
+   `Ctrl+Esc`). If needed, point it at the binary under
+   *Settings → Tools → Claude Code → Claude command*.
+
+**GitHub Codespaces.** *Code → Create codespace on main* — the container builds
+with Go + Claude Code ready. Add a Codespaces secret named
+`CLAUDE_CODE_OAUTH_TOKEN` (generate it on a trusted machine with
+`claude setup-token`) or `ANTHROPIC_API_KEY`; it auto-injects as an env var so
+`claude` works headless.
+
+**Claude Code on the web.** At [claude.ai/code](https://claude.ai/code), connect
+this GitHub repo and start a session — Anthropic's sandbox uses the same Dev
+Container. Auth and the GitHub token are managed by the platform.
+
+**Authentication summary**
+
+| Where | How |
+|-------|-----|
+| Local / GoLand (interactive) | Run `claude` once, complete the browser login (uses your Claude subscription — no API key). |
+| Codespaces / headless | Store `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) or `ANTHROPIC_API_KEY` as a secret/env var. |
+| Claude Code on the web | Managed by the platform. |
+
+The container login persists across rebuilds via the `netmesh-claude-config`
+volume mounted at `~/.claude`. Shared project permissions (allowing `go build` /
+`go test` / etc. without prompts) live in the tracked `.claude/settings.json`.
+
+> **Running the mesh inside the container:** TCP and UDP profiles work as-is.
+> The ICMP profile uses unprivileged datagram sockets gated by
+> `net.ipv4.ping_group_range`; to make ICMP probes succeed in-container on a
+> Docker host, add `"runArgs": ["--sysctl=net.ipv4.ping_group_range=0 2147483647"]`
+> to the Dev Container (see the comment in `.devcontainer/devcontainer.json`).
+> Codespaces may reject custom sysctls; ICMP otherwise reports "unavailable"
+> while the other profiles keep working.
+
 ## Implementation status
 
 | Area | State |

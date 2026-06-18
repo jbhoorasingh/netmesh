@@ -1,0 +1,63 @@
+// NetMesh dev container — a single definition that works with:
+//   • GoLand / IntelliJ Dev Containers (open natively, or connect via JetBrains Gateway)
+//   • GitHub Codespaces
+//   • Claude Code on the web (claude.ai/code)
+//
+// It provisions the Go 1.26 toolchain, Node (for the Claude Code CLI), the
+// Claude Code CLI itself, and forwards the NetMesh UI ports.
+{
+  "name": "NetMesh (Go + Claude Code)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+
+  "features": {
+    "ghcr.io/devcontainers/features/go:1": { "version": "1.26" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+
+  // Controller UI/API/WS on 5999; agent UIs on 6001-6005 for the single-host demo.
+  // (Agent data-plane ports 7001-7005 are agent<->agent inside the container and
+  // need no host forwarding.)
+  "forwardPorts": [5999, 6001, 6002, 6003, 6004, 6005],
+  "portsAttributes": {
+    "5999": { "label": "NetMesh Controller (UI/API/WS)", "onAutoForward": "notify" }
+  },
+
+  // Install the Claude Code CLI (the JetBrains plugin and the web runtime invoke
+  // `claude` from PATH), then warm the Go module cache and build.
+  "postCreateCommand": "npm install -g @anthropic-ai/claude-code && go mod download && go build ./... && echo 'NetMesh dev container ready'",
+
+  "containerEnv": {
+    "DISABLE_AUTOUPDATER": "1"
+  },
+
+  // Pass auth through for headless/CLI use. Locally these come from your shell;
+  // in Codespaces store CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) or
+  // ANTHROPIC_API_KEY as a Codespaces secret and they auto-inject. For an
+  // interactive subscription login, run `claude` once and follow the browser flow.
+  "remoteEnv": {
+    "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}"
+  },
+
+  // Persist the Claude Code login/config across container rebuilds.
+  "mounts": [
+    "source=netmesh-claude-config,target=/home/vscode/.claude,type=volume"
+  ],
+
+  "customizations": {
+    "jetbrains": {
+      "backend": "GoLand"
+    },
+    "vscode": {
+      "extensions": ["golang.go"]
+    }
+  }
+
+  // In-container ICMP (optional): the ICMP prober uses unprivileged datagram
+  // sockets, which Linux gates behind net.ipv4.ping_group_range. To make ICMP
+  // probes succeed inside the container (Docker hosts only — Codespaces may
+  // reject custom sysctls), add:
+  //   "runArgs": ["--sysctl=net.ipv4.ping_group_range=0 2147483647"]
+  // TCP and UDP profiles work without this; ICMP otherwise reports "unavailable".
+}
