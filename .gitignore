@@ -1,0 +1,14 @@
+# Compiled binary
+/netmesh
+# Test / coverage artifacts
+*.out
+*.test
+# Editor / OS
+.DS_Store
+.idea/
+# Admin config persistence
+netmesh-admin.json
+# Release build output
+/dist/
+# Local editor / tooling config
+.claude/
