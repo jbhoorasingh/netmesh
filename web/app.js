@@ -256,7 +256,7 @@
         </div>
         ${S.page === 'dashboard' ? controllerDash() : S.page === 'sequences' ? seqMonitor(false) : S.page === 'traffic' ? trafficPage() : adminPage()}
       </div>
-      ${S.detail && S.page === 'dashboard' ? drawerHTML() : ''}
+      ${S.detail && (S.page === 'dashboard' || S.page === 'sequences') ? drawerHTML() : ''}
       ${S.diagOpen ? diagHTML() : ''}
       ${S.logMax ? logMaxHTML() : ''}
     </div>`;
