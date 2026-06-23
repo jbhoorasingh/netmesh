@@ -3,6 +3,7 @@ package diag
 import (
 	"errors"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"netmesh/internal/protocol"
@@ -58,15 +59,24 @@ func TestResolveWhitelist(t *testing.T) {
 }
 
 func TestResolveBuildsFixedArgv(t *testing.T) {
+	ping := []string{"-c", "4", "8.8.8.8"}
+	traceName := "traceroute"
+	trace := []string{"-m", "20", "-w", "2", "example.com"}
+	if runtime.GOOS == "windows" {
+		ping = []string{"-n", "4", "8.8.8.8"}
+		traceName = "tracert"
+		trace = []string{"-h", "20", "-w", "2000", "example.com"}
+	}
 	tests := []struct {
-		cmd  string
-		args []string
-		want []string
+		cmd      string
+		args     []string
+		wantName string
+		wantArgv []string
 	}{
-		{"ping", []string{"8.8.8.8"}, []string{"-c", "4", "8.8.8.8"}},
-		{"traceroute", []string{"example.com"}, []string{"-m", "20", "-w", "2", "example.com"}},
-		{"nslookup", []string{"example.com"}, []string{"example.com"}},
-		{"netstat", nil, []string{"-an"}},
+		{"ping", []string{"8.8.8.8"}, "ping", ping},
+		{"traceroute", []string{"example.com"}, traceName, trace},
+		{"nslookup", []string{"example.com"}, "nslookup", []string{"example.com"}},
+		{"netstat", nil, "netstat", []string{"-an"}},
 	}
 	for _, tc := range tests {
 		name, argv, err := resolve(protocol.DiagRequest{Command: tc.cmd, Args: tc.args})
@@ -74,11 +84,11 @@ func TestResolveBuildsFixedArgv(t *testing.T) {
 			t.Errorf("resolve(%s) err = %v", tc.cmd, err)
 			continue
 		}
-		if name != tc.cmd {
-			t.Errorf("name = %q, want %q", name, tc.cmd)
+		if name != tc.wantName {
+			t.Errorf("name = %q, want %q", name, tc.wantName)
 		}
-		if !reflect.DeepEqual(argv, tc.want) {
-			t.Errorf("%s argv = %v, want %v", tc.cmd, argv, tc.want)
+		if !reflect.DeepEqual(argv, tc.wantArgv) {
+			t.Errorf("%s argv = %v, want %v", tc.cmd, argv, tc.wantArgv)
 		}
 	}
 }

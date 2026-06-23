@@ -616,7 +616,7 @@ func (c *Controller) emitFlowTransitions(metrics []protocol.Metric) {
 		}
 		c.flowLastEmit[k] = now
 
-		flow := m.AgentID + "→" + m.PeerID + " " + profDisplay(m.Profile)
+		flow := c.agentDisplay(m.AgentID) + "→" + c.agentDisplay(m.PeerID) + " " + profDisplay(m.Profile)
 		lat := float64(m.RTTMicros) / 1000
 		var typ logging.EventType
 		var detail string
@@ -642,6 +642,16 @@ func (c *Controller) emitFlowTransitions(metrics []protocol.Metric) {
 	for _, ch := range changes {
 		c.log.Emit(logging.Event{Type: ch.typ, AgentID: ch.src, PeerID: ch.dst, Detail: ch.detail})
 	}
+}
+
+func (c *Controller) agentDisplay(id string) string {
+	if id == "" {
+		return id
+	}
+	if cfg := c.admin.get(id); cfg.Label != "" {
+		return cfg.Label
+	}
+	return id
 }
 
 // meshSummaryLoop emits a periodic, real summary of mesh health while a test is

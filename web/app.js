@@ -87,6 +87,26 @@
   };
   // friendly label lookup (admin-assigned name falls back to agent id)
   function labelOf(id) { const a = S.agents.find((x) => x.id === id); return a && a.label ? a.label : id; }
+  function flowName(id) { const label = labelOf(id); return label === id ? id : label; }
+  function noteSequenceGap(agentId, missed) {
+    if (!agentId || !missed) return;
+    const n = Math.min(58, missed);
+    Object.keys(S.flowById).forEach((id) => {
+      const f = S.flowById[id];
+      if (!f || f.ctrl || f.src !== agentId) return;
+      const buf = S.seqBuf[id] || (S.seqBuf[id] = []);
+      for (let i = 0; i < n; i++) buf.push('MISS');
+      if (buf.length > 58) S.seqBuf[id] = buf.slice(-58);
+    });
+  }
+  function clearLiveTelemetry() {
+    S.metrics = [];
+    S.flows = [];
+    S.flowById = {};
+    S.seqBuf = {};
+    S.lastSeqForFlow = {};
+    S.lastRtt = {};
+  }
   function pushEvent(ev) {
     const style = EVENT_STYLE[ev.event] || ['INFO', P.accent];
     const t = ev.time ? Date.parse(ev.time) : Date.now();
@@ -95,17 +115,19 @@
       msg = ev.detail || ev.event.toLowerCase();
     } else {
       msg = ev.event.replace(/_/g, ' ').toLowerCase();
-      if (ev.agentId) msg = ev.agentId + ' · ' + msg;
+      if (ev.agentId) msg = flowName(ev.agentId) + ' · ' + msg;
       if (ev.detail) msg += ' — ' + ev.detail;
       if (ev.seq) msg += ' (seq ' + ev.seq + ')';
     }
+    if (ev.event === 'PACKET_SEQUENCE_MISSED') noteSequenceGap(ev.agentId, ev.fields && ev.fields.missed);
     const row = { id: 'e' + t + Math.random(), time: timeStr(t), tag: style[0], color: style[1], msg };
     S.events.push(row);
     if (S.events.length > 500) S.events = S.events.slice(-500);
     if (S.logPaused && S.logLevels.has(row.tag)) S.logNew++;
     updateEvents();
-    if (ev.event === 'TEST_STARTED') setRunning(true);
-    else if (ev.event === 'TEST_STOPPED') setRunning(false);
+    if (ev.event === 'TEST_STARTED') { clearLiveTelemetry(); setRunning(true); }
+    else if (ev.event === 'TEST_STOPPED') { clearLiveTelemetry(); setRunning(false); }
+    else if (ev.event === 'AGENT_CONFIG_UPDATED') refresh();
   }
   function setRunning(v) { if (S.running !== v) { S.running = v; render(); } }
 
@@ -117,7 +139,7 @@
     // rolling per-flow jitter
     const last = S.lastRtt[id]; S.lastRtt[id] = rtt;
     // sequence strip state
-    let st = m.success ? 'OK' : 'MISS';
+    let st = (m.success && !(m.lossPct > 0)) ? 'OK' : 'MISS';
     if (m.success && m.seq && S.lastSeqForFlow[id] && m.seq < S.lastSeqForFlow[id]) st = 'REORD';
     if (m.seq) S.lastSeqForFlow[id] = Math.max(S.lastSeqForFlow[id] || 0, m.seq);
     const buf = S.seqBuf[id] || (S.seqBuf[id] = []);
@@ -730,7 +752,7 @@
     if (isController()) {
       if (S.selectedNode) rows = rows.filter((r) => r.src === S.selectedNode || r.dst === S.selectedNode);
       if (S.filter !== 'ALL') rows = rows.filter((r) => r.profile === S.filter);
-      if (S.query.trim()) { const q = S.query.toLowerCase(); rows = rows.filter((r) => (r.src || '').toLowerCase().includes(q) || (r.dst || '').toLowerCase().includes(q)); }
+      if (S.query.trim()) { const q = S.query.toLowerCase(); rows = rows.filter((r) => (r.src || '').toLowerCase().includes(q) || (r.dst || '').toLowerCase().includes(q) || flowName(r.src).toLowerCase().includes(q) || flowName(r.dst).toLowerCase().includes(q)); }
       const dir = S.sortDir === 'asc' ? 1 : -1;
       rows.sort((a, b) => { let av = a[S.sortKey], bv = b[S.sortKey]; if (typeof av === 'string') return (av || '').localeCompare(bv || '') * dir; return ((av || 0) - (bv || 0)) * dir; });
     } else {
@@ -746,8 +768,8 @@
     const sel = S.detail && S.detail.mode === 'test' && S.detail.flowId === r.id;
     const bg = sel ? P.accent + '1c' : (st[2] === 'red' ? P.red + '10' : 'transparent');
     return `<tr data-act="openTest" data-arg="${esc(r.id)}" style="border-bottom:1px solid #11181f;background:${bg};cursor:pointer">
-      <td style="padding:6px 10px;color:#cdd9e5;white-space:nowrap">${esc(r.src)}</td>
-      <td style="padding:6px 10px;color:#8b98a8;white-space:nowrap">${esc(r.dst)}</td>
+      <td title="${esc(r.src)}" style="padding:6px 10px;color:#cdd9e5;white-space:nowrap">${esc(flowName(r.src))}</td>
+      <td title="${esc(r.dst)}" style="padding:6px 10px;color:#8b98a8;white-space:nowrap">${esc(flowName(r.dst))}</td>
       <td style="padding:6px 10px"><span style="color:${pm[0]};border:1px solid ${pm[1]};padding:1px 6px;border-radius:4px;font-size:10px">${esc(r.profile)}</span></td>
       ${withPort ? `<td style="padding:6px 10px;color:#7b8898">${r.port || '—'}</td>` : ''}
       <td style="padding:6px 10px;color:#cdd9e5;text-align:right">${r.latency.toFixed(1)}</td>
@@ -764,7 +786,7 @@
       : `<tr><td colspan="8" style="padding:18px;text-align:center;color:#465061">no flows yet — ${isController() ? 'press START TEST or wait for agents' : 'awaiting test from controller'}</td></tr>`;
     const rc = document.getElementById('nm-rowcount'); if (rc) rc.textContent = rows.length;
     const chip = document.getElementById('nm-nodechip');
-    if (chip) chip.innerHTML = S.selectedNode ? `<button data-act="clearNode" style="font:600 9px 'IBM Plex Mono';letter-spacing:.04em;padding:4px 8px;border-radius:5px;border:1px solid #2f81f7;background:#1f6feb22;color:#7cb7ff;display:flex;align-items:center;gap:6px">▣ ${esc(S.selectedNode)}<span style="color:#9fb1c6">✕</span></button>` : '';
+    if (chip) chip.innerHTML = S.selectedNode ? `<button data-act="clearNode" title="${esc(S.selectedNode)}" style="font:600 9px 'IBM Plex Mono';letter-spacing:.04em;padding:4px 8px;border-radius:5px;border:1px solid #2f81f7;background:#1f6feb22;color:#7cb7ff;display:flex;align-items:center;gap:6px">▣ ${esc(flowName(S.selectedNode))}<span style="color:#9fb1c6">✕</span></button>` : '';
   }
 
   function updateKpis() {
@@ -838,7 +860,7 @@
     const tests = seqTests();
     const sc = document.getElementById('nm-seqcount'); if (sc) sc.textContent = tests.length;
     list.innerHTML = tests.length ? tests.map((t) => `<button data-act="openTest" data-arg="${esc(t.id)}" style="width:100%;text-align:left;display:flex;align-items:center;gap:13px;background:#0d131c;border:1px solid #18212d;border-radius:7px;padding:9px 12px;margin-bottom:6px">
-        <div style="flex:0 0 188px;display:flex;align-items:center;gap:7px;min-width:0"><span style="font:600 11px 'IBM Plex Mono';color:#cdd9e5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.src)}</span><span style="color:#465061">→</span><span style="font:600 11px 'IBM Plex Mono';color:#8b98a8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.dst)}</span></div>
+        <div style="flex:0 0 188px;display:flex;align-items:center;gap:7px;min-width:0"><span title="${esc(t.src)}" style="font:600 11px 'IBM Plex Mono';color:#cdd9e5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(flowName(t.src))}</span><span style="color:#465061">→</span><span title="${esc(t.dst)}" style="font:600 11px 'IBM Plex Mono';color:#8b98a8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(flowName(t.dst))}</span></div>
         <span style="flex:0 0 auto;color:${t.profColor};border:1px solid ${t.profBorder};padding:1px 6px;border-radius:4px;font:500 9px 'IBM Plex Mono'">${esc(t.profile)}</span>
         <div style="flex:1;min-width:0;display:flex;gap:1px;align-items:stretch;height:18px">${t.strip.map((x) => `<span style="flex:1;border-radius:1px;background:${colorFor(x === 'MISS' ? 'red' : x === 'REORD' ? 'yellow' : 'green')}"></span>`).join('')}</div>
         <span style="flex:0 0 56px;text-align:right;font:500 10px 'IBM Plex Mono';color:#9fb1c6">${t.latency.toFixed(1)}ms</span>
@@ -890,7 +912,7 @@
       ${a && a.ports && a.ports.length ? `<div style="flex:0 0 auto;padding:0 16px 10px"><div style="display:flex;align-items:center;gap:10px;background:#0e141d;border:1px solid #1a2330;border-radius:7px;padding:9px 11px;font:500 10px 'IBM Plex Mono';flex-wrap:wrap"><span style="color:#5d6a7c;letter-spacing:.08em">LISTEN PORTS</span>${a.ports.map((p) => `<span style="color:${p.udp || p.tcp ? '#7ee787' : '#f85149'}">${p.port}<span style="color:#566273">${p.udp ? ' udp' : ''}${p.tcp ? ' tcp' : ''}</span></span>`).join('')}</div></div>` : ''}
       <div style="flex:0 0 auto;padding:4px 16px 8px;font:600 9px 'IBM Plex Mono';letter-spacing:.12em;color:#5d6a7c">TESTS &amp; FLOWS — click for probe detail</div>
       <div style="flex:1;min-height:0;overflow:auto;padding:0 12px 12px">
-        ${flows.map((f) => { const st = statusOf(f.latency, f.loss); const pm = PROF[f.profile] || ['#8b98a8', '#8b98a844']; const peer = f.ctrl ? 'controller' : (f.src === id ? f.dst : f.src); const dir = f.ctrl ? 'WS·CTRL' : (f.src === id ? 'OUT →' : '← IN'); return `<button data-act="openTest" data-arg="${esc(f.id)}" style="width:100%;text-align:left;display:flex;align-items:center;gap:10px;background:#0d131c;border:1px solid #18212d;border-radius:7px;padding:9px 11px;margin-bottom:6px"><span style="font:600 8px 'IBM Plex Mono';color:${f.ctrl ? P.accent : '#7b8898'};width:42px;flex:0 0 auto">${dir}</span><span style="font:600 11px 'IBM Plex Mono';color:#cdd9e5;flex:1;min-width:0">${esc(peer)}</span><span style="color:${pm[0]};border:1px solid ${pm[1]};padding:1px 6px;border-radius:4px;font:500 9px 'IBM Plex Mono'">${esc(f.profile)}</span><span style="font:500 10px 'IBM Plex Mono';color:#8b98a8;width:50px;text-align:right">${f.latency.toFixed(1)}ms</span><span style="width:7px;height:7px;border-radius:50%;background:${colorFor(st)};box-shadow:0 0 5px ${colorFor(st)};flex:0 0 auto"></span><span style="color:#465061;font-size:13px">›</span></button>`; }).join('')}
+        ${flows.map((f) => { const st = statusOf(f.latency, f.loss); const pm = PROF[f.profile] || ['#8b98a8', '#8b98a844']; const peer = f.ctrl ? 'controller' : (f.src === id ? f.dst : f.src); const dir = f.ctrl ? 'WS·CTRL' : (f.src === id ? 'OUT →' : '← IN'); return `<button data-act="openTest" data-arg="${esc(f.id)}" style="width:100%;text-align:left;display:flex;align-items:center;gap:10px;background:#0d131c;border:1px solid #18212d;border-radius:7px;padding:9px 11px;margin-bottom:6px"><span style="font:600 8px 'IBM Plex Mono';color:${f.ctrl ? P.accent : '#7b8898'};width:42px;flex:0 0 auto">${dir}</span><span title="${esc(peer)}" style="font:600 11px 'IBM Plex Mono';color:#cdd9e5;flex:1;min-width:0">${esc(flowName(peer))}</span><span style="color:${pm[0]};border:1px solid ${pm[1]};padding:1px 6px;border-radius:4px;font:500 9px 'IBM Plex Mono'">${esc(f.profile)}</span><span style="font:500 10px 'IBM Plex Mono';color:#8b98a8;width:50px;text-align:right">${f.latency.toFixed(1)}ms</span><span style="width:7px;height:7px;border-radius:50%;background:${colorFor(st)};box-shadow:0 0 5px ${colorFor(st)};flex:0 0 auto"></span><span style="color:#465061;font-size:13px">›</span></button>`; }).join('')}
       </div>
       ${isController() ? `<div style="flex:0 0 auto;padding:11px 16px;border-top:1px solid #161e29"><button data-act="openDiag" data-arg="${esc(id)}" ${readOnly() ? 'disabled' : ''} style="width:100%;font:600 11px 'IBM Plex Mono';letter-spacing:.04em;padding:10px;border-radius:7px;border:1px solid ${readOnly() ? '#1c2632' : '#233044'};background:${readOnly() ? '#0d121a' : '#101826'};color:${readOnly() ? '#3a4757' : P.accent};opacity:${readOnly() ? '.6' : '1'}">⌗ Open Remote Diagnostics Terminal</button></div>` : ''}`;
   }
@@ -906,7 +928,7 @@
     el.innerHTML = `
       <div style="flex:0 0 auto;padding:12px 16px;border-bottom:1px solid #161e29">
         <div style="display:flex;align-items:center;gap:10px"><button data-act="backToNode" style="background:transparent;border:1px solid #1f2a37;color:#8b98a8;border-radius:6px;padding:5px 9px;font:500 10px 'IBM Plex Mono'">‹ back</button><div style="font:600 10px 'IBM Plex Mono';letter-spacing:.12em;color:#6b7888;flex:1">PROBE / TEST DETAIL</div><button data-act="closeDetail" style="background:transparent;border:none;color:#6b7888;font-size:16px;line-height:1">✕</button></div>
-        <div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span style="font:600 13px 'IBM Plex Mono';color:#cdd9e5">${esc(r.src)}</span><span style="color:#465061">→</span><span style="font:600 13px 'IBM Plex Mono';color:#cdd9e5">${esc(r.dst)}</span><span style="color:${pm[0]};border:1px solid ${pm[1]};padding:2px 7px;border-radius:4px;font:500 10px 'IBM Plex Mono'">${esc(r.profile)}</span><span style="font:500 10px 'IBM Plex Mono';color:#566273">:${r.port || '—'}</span></div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span title="${esc(r.src)}" style="font:600 13px 'IBM Plex Mono';color:#cdd9e5">${esc(flowName(r.src))}</span><span style="color:#465061">→</span><span title="${esc(r.dst)}" style="font:600 13px 'IBM Plex Mono';color:#cdd9e5">${esc(flowName(r.dst))}</span><span style="color:${pm[0]};border:1px solid ${pm[1]};padding:2px 7px;border-radius:4px;font:500 10px 'IBM Plex Mono'">${esc(r.profile)}</span><span style="font:500 10px 'IBM Plex Mono';color:#566273">:${r.port || '—'}</span></div>
       </div>
       <div style="flex:0 0 auto;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:12px 16px">
         ${miniStat('LATENCY', r.latency.toFixed(1), ' ms')}${miniStat('JITTER', (r.jitter || 0).toFixed(2), ' ms')}${miniStat('LOST', lostPct.toFixed(1), ' %')}
@@ -1047,7 +1069,7 @@
       if (body.srcAgent === body.dstAgent) { alert('source and destination agent must differ'); return; }
       if (proto !== 'icmp' && !body.dstPort) { alert('a destination port is required for UDP/TCP'); return; }
       const r = await postJSON('/api/flows/upsert', body);
-      if (r.ok) { await fetchFlows(); updateFlowRows(); ['nm-nf-name', 'nm-nf-srcport', 'nm-nf-dstport'].forEach((c) => { const e = g(c); if (e) e.value = ''; }); }
+      if (r.ok) { clearLiveTelemetry(); await fetchFlows(); updateFlowRows(); renderData(); ['nm-nf-name', 'nm-nf-srcport', 'nm-nf-dstport'].forEach((c) => { const e = g(c); if (e) e.value = ''; }); }
       else alert('Add failed: ' + (await r.text()));
     },
     saveFlow: async (id) => {
@@ -1065,16 +1087,16 @@
       if (body.srcAgent === body.dstAgent) { alert('source and destination agent must differ'); return; }
       if (proto !== 'icmp' && !body.dstPort) { alert('a destination port is required for UDP/TCP'); return; }
       const r = await postJSON('/api/flows/upsert', body);
-      if (r.ok) { await fetchFlows(); updateFlowRows(); } else alert('Save failed: ' + (await r.text()));
+      if (r.ok) { clearLiveTelemetry(); await fetchFlows(); updateFlowRows(); renderData(); } else alert('Save failed: ' + (await r.text()));
     },
-    deleteFlow: async (id) => { const r = await postJSON('/api/flows/delete', { id }); if (r.ok) { await fetchFlows(); updateFlowRows(); } },
-    clearFlows: async () => { if (!confirm('Delete all traffic flows?')) return; const r = await postJSON('/api/flows/clear', {}); if (r.ok) { await fetchFlows(); updateFlowRows(); } },
+    deleteFlow: async (id) => { const r = await postJSON('/api/flows/delete', { id }); if (r.ok) { clearLiveTelemetry(); await fetchFlows(); updateFlowRows(); renderData(); } },
+    clearFlows: async () => { if (!confirm('Delete all traffic flows?')) return; const r = await postJSON('/api/flows/clear', {}); if (r.ok) { clearLiveTelemetry(); await fetchFlows(); updateFlowRows(); renderData(); } },
     genMesh: async () => {
       const port = parseInt((document.getElementById('nm-mesh-port') || {}).value || '0', 10) || 0;
       const protocols = [...document.querySelectorAll('.nm-mesh-proto')].filter((c) => c.checked).map((c) => c.getAttribute('data-prof'));
       const symmetric = (document.getElementById('nm-mesh-sym') || {}).checked || false;
       const r = await postJSON('/api/flows/mesh', { port, protocols, symmetric });
-      if (r.ok) { await fetchFlows(); updateFlowRows(); } else alert('Mesh failed: ' + (await r.text()));
+      if (r.ok) { clearLiveTelemetry(); await fetchFlows(); updateFlowRows(); renderData(); } else alert('Mesh failed: ' + (await r.text()));
     },
     maximizeLog: () => { S.logMax = true; render(); },
     closeLogMax: () => { S.logMax = false; render(); },
