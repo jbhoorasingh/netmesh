@@ -301,6 +301,7 @@ func (c *Controller) handleFlowUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	saved := c.flows.upsert(f)
+	c.store.Clear()
 	c.reapplyIfRunning()
 	writeJSON(w, http.StatusOK, saved)
 }
@@ -313,12 +314,14 @@ func (c *Controller) handleFlowDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.flows.remove(body.ID)
+	c.store.Clear()
 	c.reapplyIfRunning()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "id": body.ID})
 }
 
 func (c *Controller) handleFlowsClear(w http.ResponseWriter, r *http.Request) {
 	c.flows.clear()
+	c.store.Clear()
 	c.reapplyIfRunning()
 	writeJSON(w, http.StatusOK, map[string]any{"status": "cleared"})
 }
@@ -359,6 +362,7 @@ func (c *Controller) handleFlowsMesh(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	c.store.Clear()
 	c.reapplyIfRunning()
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "mesh-generated", "added": added})
 }
@@ -389,6 +393,7 @@ func (c *Controller) handleTestStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c.resetFlows()
+	c.store.Clear()
 	c.running.Store(true)
 	runID, flows := c.applyFlows(interval)
 
@@ -400,6 +405,7 @@ func (c *Controller) handleTestStart(w http.ResponseWriter, r *http.Request) {
 func (c *Controller) handleTestStop(w http.ResponseWriter, r *http.Request) {
 	c.running.Store(false)
 	c.resetFlows()
+	c.store.Clear()
 	c.hub.Broadcast(protocol.TypeTestStop, nil)
 	c.log.Emit(logging.Event{Type: logging.TestStopped})
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "stopped"})

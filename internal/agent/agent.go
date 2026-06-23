@@ -143,6 +143,7 @@ func (a *Agent) onControl(env protocol.Envelope, out transport.Sender) {
 			a.log.Warnf("agent: bad flow plan", "err", err)
 			return
 		}
+		a.engine.Stop()
 		a.mu.Lock()
 		a.flows = plan.Flows
 		a.mu.Unlock()

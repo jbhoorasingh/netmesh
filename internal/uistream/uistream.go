@@ -101,6 +101,14 @@ func (s *Store) Ingest(metrics []protocol.Metric) {
 	}
 }
 
+// Clear drops all latest metrics. A new test run starts from a clean view so
+// stale metrics from deleted or protocol-changed flows do not affect summaries.
+func (s *Store) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latest = make(map[string]protocol.Metric)
+}
+
 // Snapshot returns the current latest-metric set.
 func (s *Store) Snapshot() []protocol.Metric {
 	s.mu.RLock()
