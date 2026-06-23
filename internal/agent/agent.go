@@ -30,8 +30,9 @@ import (
 	"netmesh/web"
 )
 
-// Version is the advertised build version.
-const Version = "0.1.0-dev"
+// Version is the advertised build version. Release builds override this via
+// -ldflags "-X netmesh/internal/agent.Version=<tag>" (see .github/workflows/release.yml).
+const Version = "0.2.0-dev"
 
 // Agent is the Node runtime.
 type Agent struct {
