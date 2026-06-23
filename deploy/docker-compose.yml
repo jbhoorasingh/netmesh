@@ -1,0 +1,57 @@
+name: netmesh
+
+# A self-contained test mesh: one Controller (Master) and three Agents (Nodes),
+# all on a single bridge network so agent-to-agent data-plane probes are
+# mutually reachable by container IP. Each service runs the same image, built
+# once from ./Dockerfile (which pulls the released binary).
+#
+#   cd deploy && docker compose up --build -d
+#   open http://localhost:5999            # controller dashboard
+#   ./seed.sh                             # (optional) generate a mesh + start a test
+#
+# Pin a different release:  NETMESH_VERSION=v0.2.0 docker compose up --build -d
+
+x-svc: &svc
+  build:
+    context: .
+    args:
+      VERSION: ${NETMESH_VERSION:-v0.2.0}
+  image: netmesh:${NETMESH_VERSION:-v0.2.0}
+  restart: unless-stopped
+  networks: [mesh]
+
+# Agent-only extras: agents join the controller, and need unprivileged ICMP
+# (ping) datagram sockets enabled so ICMP flows work without --privileged.
+x-agent: &agent
+  depends_on: [controller]
+  sysctls:
+    net.ipv4.ping_group_range: "0 2147483647"
+
+services:
+  controller:
+    <<: *svc
+    command: ["-master=self", "-port=5999", "-id=controller"]
+    ports:
+      - "5999:5999" # http://localhost:5999 -> controller dashboard
+
+  agent1:
+    <<: [*svc, *agent]
+    command: ["-master=controller:5999", "-port=5999", "-id=agent1"]
+    ports:
+      - "6001:5999" # http://localhost:6001 -> agent1 local UI
+
+  agent2:
+    <<: [*svc, *agent]
+    command: ["-master=controller:5999", "-port=5999", "-id=agent2"]
+    ports:
+      - "6002:5999" # http://localhost:6002 -> agent2 local UI
+
+  agent3:
+    <<: [*svc, *agent]
+    command: ["-master=controller:5999", "-port=5999", "-id=agent3"]
+    ports:
+      - "6003:5999" # http://localhost:6003 -> agent3 local UI
+
+networks:
+  mesh:
+    driver: bridge

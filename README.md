@@ -62,6 +62,18 @@ Open `http://<host>:5999/` for the UI on either role, then press **START TEST**
 on the Controller. To try the whole mesh on one machine, give each agent a
 distinct data port — see [Data plane](#data-plane).
 
+**Docker Compose (zero-build test mesh):** spin up a Controller + three Agents
+from the released binary — no Go toolchain required:
+
+```bash
+cd deploy
+docker compose up --build -d      # pulls the v0.2.0 binary into Alpine images
+open http://localhost:5999        # controller dashboard
+./seed.sh                         # (optional) generate a mesh + start a test
+```
+
+See [deploy/README.md](deploy/README.md) for details, scaling, and RBAC options.
+
 ## CLI
 
 | Flag      | Meaning                                                                 |
