@@ -9,11 +9,11 @@
   // ---------- palette / helpers ----------
   const P = { green: '#3fb950', yellow: '#d29922', red: '#f85149', accent: '#58a6ff' };
   const PROF = {
-    'UDP-Sym': ['#7ee787', '#7ee78744'], 'UDP-Dyn': ['#a5a5ff', '#a5a5ff44'],
-    'TCP': ['#58a6ff', '#58a6ff44'], 'ICMP': ['#f0883e', '#f0883e44'], 'WS': ['#58a6ff', '#58a6ff44'],
+    'UDP': ['#7ee787', '#7ee78744'], 'TCP': ['#58a6ff', '#58a6ff44'],
+    'ICMP': ['#f0883e', '#f0883e44'], 'WS': ['#58a6ff', '#58a6ff44'],
   };
-  const PROF_DISPLAY = { udp_symmetric: 'UDP-Sym', udp_dynamic: 'UDP-Dyn', tcp: 'TCP', icmp: 'ICMP', '': 'WS' };
-  const PORT_FOR = { 'UDP-Sym': 9000, 'UDP-Dyn': 0, 'TCP': 5201, 'ICMP': 0, 'WS': 5999 };
+  const PROF_DISPLAY = { udp: 'UDP', tcp: 'TCP', icmp: 'ICMP', '': 'WS' };
+  const PROTOCOLS = [['udp', 'UDP'], ['tcp', 'TCP'], ['icmp', 'ICMP']];
 
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const portFromAddr = (a) => { if (!a) return 0; const i = a.lastIndexOf(':'); return i < 0 ? 0 : (parseInt(a.slice(i + 1), 10) || 0); };
@@ -42,7 +42,7 @@
     logMax: false, logPaused: false, logNew: 0,
     logLevels: new Set(['INFO', 'WARN', 'ERR', 'TEST', 'ADMIN']),
     logQuery: '',
-    testSetup: false, testPort: 0,
+    trafficFlows: [],
     structKey: '',
   };
   for (let i = 0; i < 90; i++) { S.hLat.push(0); S.hJit.push(0); S.hLoss.push(0); }
@@ -110,7 +110,7 @@
   function setRunning(v) { if (S.running !== v) { S.running = v; render(); } }
 
   // ---------- telemetry ingest ----------
-  function flowIdOf(m) { return m.agentId + '>' + m.peerId + '/' + (m.profile || 'ws'); }
+  function flowIdOf(m) { return m.flowId || (m.agentId + '>' + m.peerId + '/' + (m.profile || 'ws')); }
   function ingestMetric(m) {
     const id = flowIdOf(m);
     const rtt = (m.rttUs || 0) / 1000;
@@ -137,11 +137,10 @@
     }
     // data-plane flows (from latest metrics)
     S.metrics.forEach((m) => {
-      const prof = PROF_DISPLAY[m.profile] || m.profile;
+      const prof = PROF_DISPLAY[m.profile] || (m.profile || '').toUpperCase();
       const rtt = (m.rttUs || 0) / 1000;
-      const id = m.agentId + '>' + m.peerId + '/' + m.profile;
-      const port = portFromAddr(m.remoteAddr) || PORT_FOR[prof] || 0;
-      flows.push({ id, src: m.agentId, dst: m.peerId, profile: prof, port, latency: rtt, jitter: estJit(id, rtt), loss: m.success ? (m.lossPct || 0) : 100, success: m.success, err: m.err, ctrl: false, ttl: m.ttl || 0, localAddr: m.localAddr || '', remoteAddr: m.remoteAddr || '' });
+      const id = m.flowId || (m.agentId + '>' + m.peerId + '/' + m.profile);
+      flows.push({ id, src: m.agentId, dst: m.peerId, profile: prof, port: portFromAddr(m.remoteAddr), srcPort: portFromAddr(m.localAddr), latency: rtt, jitter: estJit(id, rtt), loss: m.success ? (m.lossPct || 0) : 100, success: m.success, err: m.err, ctrl: false, ttl: m.ttl || 0, localAddr: m.localAddr || '', remoteAddr: m.remoteAddr || '' });
     });
     S.flows = flows;
     S.flowById = {}; flows.forEach((f) => S.flowById[f.id] = f);
@@ -184,7 +183,7 @@
 
   // structural render: rebuilt only when the layout (role/page/drawer/diag/auth) changes
   function structureKey() {
-    return [S.info.role, S.page, S.detail ? S.detail.mode : '', !!S.diagOpen, !!S.logMax, !!S.testSetup, readOnly(), S.info.authEnabled && S.info.authenticated, !!S.selectedNode, S.info.role === 'agent' && !infoJoined(), S.running].join('|');
+    return [S.info.role, S.page, S.detail ? S.detail.mode : '', !!S.diagOpen, !!S.logMax, readOnly(), S.info.authEnabled && S.info.authenticated, !!S.selectedNode, S.info.role === 'agent' && !infoJoined(), S.running].join('|');
   }
   function infoJoined() { return S.info.joined || (S.info.master && S.info.master !== ''); }
 
@@ -237,7 +236,7 @@
       </div>
       <div style="width:1px;height:22px;background:#1b2430"></div>
       ${isC ? `${runPill}
-      <button data-act="openTestSetup" ${startDisabled ? 'disabled' : ''} style="${startStyle}">▷ START TEST</button>
+      <button data-act="startTest" ${startDisabled ? 'disabled' : ''} style="${startStyle}">▷ START TEST</button>
       <button data-act="stopTest" ${stopDisabled ? 'disabled' : ''} style="${stopStyle}">▢ STOP</button>
       <div style="width:1px;height:22px;background:#1b2430"></div>` : ''}
       ${auth}
@@ -252,44 +251,96 @@
         <div style="flex:0 0 auto;display:flex;gap:5px">
           <button data-act="goDash" style="${subTab(S.page === 'dashboard')}">▦ Dashboard</button>
           <button data-act="goSeq" style="${subTab(S.page === 'sequences')}">⠿ Sequence Monitor</button>
+          <button data-act="goTraffic" style="${subTab(S.page === 'traffic')}">⇄ Traffic Flows</button>
           <button data-act="goAdmin" style="${subTab(S.page === 'admin')}">⚙ Admin</button>
         </div>
-        ${S.page === 'dashboard' ? controllerDash() : S.page === 'sequences' ? seqMonitor(false) : adminPage()}
+        ${S.page === 'dashboard' ? controllerDash() : S.page === 'sequences' ? seqMonitor(false) : S.page === 'traffic' ? trafficPage() : adminPage()}
       </div>
-      ${S.detail && S.page !== 'admin' ? drawerHTML() : ''}
+      ${S.detail && S.page === 'dashboard' ? drawerHTML() : ''}
       ${S.diagOpen ? diagHTML() : ''}
       ${S.logMax ? logMaxHTML() : ''}
-      ${S.testSetup ? testSetupHTML() : ''}
     </div>`;
   }
 
-  function testSetupHTML() {
-    const ro = readOnly();
-    const PROFS = [['udp_symmetric', 'UDP-Sym'], ['udp_dynamic', 'UDP-Dyn'], ['tcp', 'TCP'], ['icmp', 'ICMP']];
-    return `<div style="position:absolute;inset:0;background:#05070ad9;backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:55">
-      <div id="nm-test-setup" style="width:460px;max-width:calc(100% - 36px);background:linear-gradient(180deg,#10161f,#0b0f15);border:1px solid #233044;border-radius:12px;box-shadow:0 30px 80px #000c;padding:24px;animation:nm-rise .2s ease">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
-          <div style="width:28px;height:28px;border-radius:7px;background:linear-gradient(135deg,#1f6feb,#0b3a8a);display:flex;align-items:center;justify-content:center;color:#cfe0ff">▷</div>
-          <div style="font:700 15px 'IBM Plex Sans';color:#eef3fa">Set up data-plane test</div>
-          <div style="flex:1"></div>
-          <button data-act="closeTestSetup" style="background:transparent;border:none;color:#6b7888;font-size:16px;cursor:pointer">✕</button>
-        </div>
+  // ---------- traffic flows editor ----------
+  const INP = "background:#0a0e14;border:1px solid #1c2632;border-radius:5px;color:#cdd9e5;font:500 11px 'IBM Plex Mono';padding:6px 8px;outline:none";
+  function agentSelect(cls, value) {
+    const opts = S.agents.map((a) => `<option value="${esc(a.id)}" ${a.id === value ? 'selected' : ''}>${esc(a.label || a.id)}</option>`).join('');
+    // Preserve a flow's saved agent even if it is momentarily disconnected, so
+    // the row can still be edited/saved and re-selected instead of silently
+    // resetting to the empty option.
+    const offline = (value && !S.agents.some((a) => a.id === value))
+      ? `<option value="${esc(value)}" selected>${esc(value)} (offline)</option>` : '';
+    return `<select class="${cls}" style="${INP};min-width:96px"><option value="">— agent —</option>${offline}${opts}</select>`;
+  }
+  function protoSelect(cls, value) {
+    return `<select class="${cls}" style="${INP}">${PROTOCOLS.map(([p, l]) => `<option value="${p}" ${p === value ? 'selected' : ''}>${l}</option>`).join('')}</select>`;
+  }
 
-        <div style="font:600 9px 'IBM Plex Mono';letter-spacing:.13em;color:#5d6a7c;margin-bottom:6px">DATA-PLANE PORT</div>
-        <input id="nm-test-port" type="number" min="0" max="65535" value="${S.testPort || ''}" placeholder="0 = each agent's default data port" style="width:100%;background:#0a0e14;border:1px solid #233044;border-radius:7px;color:#eef3fa;font:500 13px 'IBM Plex Mono';padding:10px 12px;outline:none;margin-bottom:4px"/>
-        <div style="font:500 9px 'IBM Plex Mono';color:#465061;margin-bottom:16px">agents bind this port and probe each other on it; <b style="color:#7b8898">0</b> uses each agent's own data port</div>
+  function trafficPage() {
+    if (readOnly()) {
+      return `<div style="flex:1;display:flex;align-items:center;justify-content:center"><div style="text-align:center;max-width:380px"><div style="font-size:26px;margin-bottom:10px">🔒</div><div style="font:600 14px 'IBM Plex Sans';color:#cdd9e5;margin-bottom:8px">Traffic configuration is restricted</div><div style="font:500 11px/1.5 'IBM Plex Mono';color:#566273;margin-bottom:18px">Log in to define and run traffic flows.</div><button data-act="login" style="font:600 12px 'IBM Plex Sans';color:#fff;background:#1f6feb;border:none;padding:10px 20px;border-radius:7px">Login</button></div></div>`;
+    }
+    return `<div style="flex:1;min-height:0;display:flex;flex-direction:column;gap:10px">
+      <div style="flex:0 0 auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <div style="font:600 11px 'IBM Plex Mono';letter-spacing:.13em;color:#8b98a8">TRAFFIC FLOWS</div>
+        <div style="font:500 10px 'IBM Plex Mono';color:#566273">srcAgent:srcPort —proto→ dstAgent:dstPort · src 0 = dynamic</div>
+        <div style="flex:1"></div>
+        <span style="font:500 10px 'IBM Plex Mono';color:#566273">mesh:</span>
+        <input id="nm-mesh-port" type="number" min="0" max="65535" placeholder="port" value="5201" style="${INP};width:64px"/>
+        ${PROTOCOLS.map(([p, l]) => `<label style="display:inline-flex;align-items:center;gap:3px;font:500 10px 'IBM Plex Mono';color:#9fb1c6"><input type="checkbox" class="nm-mesh-proto" data-prof="${p}" checked/>${l}</label>`).join('')}
+        <label style="display:inline-flex;align-items:center;gap:3px;font:500 10px 'IBM Plex Mono';color:#9fb1c6" title="bind source port = destination port"><input type="checkbox" id="nm-mesh-sym"/>sym</label>
+        <button data-act="genMesh" style="font:600 10px 'IBM Plex Mono';padding:6px 10px;border-radius:6px;border:1px solid #243a57;background:#101826;color:#7cb7ff;cursor:pointer">⊞ Generate mesh</button>
+        <button data-act="clearFlows" style="font:600 10px 'IBM Plex Mono';padding:6px 10px;border-radius:6px;border:1px solid #5a2730;background:#2a1418;color:#f0a3a3;cursor:pointer">Clear all</button>
+      </div>
 
-        <div style="font:600 9px 'IBM Plex Mono';letter-spacing:.13em;color:#5d6a7c;margin-bottom:7px">TRAFFIC PROFILES</div>
-        <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:16px">
-          ${PROFS.map(([p, lbl]) => `<label style="display:inline-flex;align-items:center;gap:5px;font:500 11px 'IBM Plex Mono';color:#9fb1c6;background:#0a0e14;border:1px solid #1c2632;border-radius:6px;padding:7px 10px;cursor:pointer"><input type="checkbox" class="nm-test-proto" data-prof="${p}" ${(!S.testProtocols || S.testProtocols.has(p)) ? 'checked' : ''}/>${lbl}</label>`).join('')}
-        </div>
+      <div style="flex:0 0 auto;background:#0d131c;border:1px solid #18212d;border-radius:8px;padding:10px 12px;display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap">
+        <div><div style="font:600 8px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c;margin-bottom:4px">SOURCE</div>${agentSelect('nm-nf-src', '')}</div>
+        <div><div style="font:600 8px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c;margin-bottom:4px">SRC PORT</div><input class="nm-nf-srcport" type="number" min="0" max="65535" placeholder="dynamic" style="${INP};width:78px"/></div>
+        <div><div style="font:600 8px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c;margin-bottom:4px">PROTO</div>${protoSelect('nm-nf-proto', 'udp')}</div>
+        <div style="color:#465061;align-self:center;padding-bottom:7px">→</div>
+        <div><div style="font:600 8px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c;margin-bottom:4px">DEST</div>${agentSelect('nm-nf-dst', '')}</div>
+        <div><div style="font:600 8px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c;margin-bottom:4px">DST PORT</div><input class="nm-nf-dstport" type="number" min="0" max="65535" placeholder="port" style="${INP};width:78px"/></div>
+        <input class="nm-nf-name" placeholder="name (optional)" style="${INP};width:140px"/>
+        <button data-act="addFlow" style="font:600 11px 'IBM Plex Mono';padding:7px 13px;border-radius:6px;border:1px solid #2f6b3a;background:#13351f;color:#7ee787;cursor:pointer">+ Add flow</button>
+      </div>
 
-        <div style="font:600 9px 'IBM Plex Mono';letter-spacing:.13em;color:#5d6a7c;margin-bottom:6px">TX INTERVAL (ms)</div>
-        <input id="nm-test-interval" type="number" min="50" max="5000" value="${S.txInterval}" style="width:100%;background:#0a0e14;border:1px solid #233044;border-radius:7px;color:#eef3fa;font:500 13px 'IBM Plex Mono';padding:10px 12px;outline:none;margin-bottom:18px"/>
-
-        <button data-act="runTest" ${ro ? 'disabled' : ''} style="width:100%;font:600 13px 'IBM Plex Sans';color:#fff;background:${ro ? '#1c2632' : '#1f6feb'};border:none;padding:12px;border-radius:8px;cursor:${ro ? 'not-allowed' : 'pointer'};box-shadow:0 4px 16px #1f6feb55">▷ Start test</button>
+      <div style="flex:1;min-height:0;overflow:auto;background:#0c1118;border:1px solid #1a2330;border-radius:8px">
+        <table style="width:100%;border-collapse:collapse;font:500 11px 'IBM Plex Mono'">
+          <thead style="position:sticky;top:0;background:#0d131c;z-index:2"><tr style="color:#5d6a7c;text-align:left">
+            ${['NAME', 'SOURCE', 'SRC PORT', 'PROTO', 'DEST', 'DST PORT', 'ON', ''].map((h) => `<th style="padding:8px 10px;font:600 9px 'IBM Plex Mono';letter-spacing:.08em;border-bottom:1px solid #1a2330">${h}</th>`).join('')}
+          </tr></thead>
+          <tbody id="nm-flow-rows">${flowRowsHTML()}</tbody>
+        </table>
       </div>
     </div>`;
+  }
+
+  function flowRowsHTML() {
+    const flows = S.trafficFlows || [];
+    if (!flows.length) return `<tr><td colspan="8" style="padding:22px;text-align:center;color:#465061">no flows defined — add one above or generate a mesh</td></tr>`;
+    return flows.map((f) => {
+      const icmp = f.protocol === 'icmp';
+      return `<tr data-flow="${esc(f.id)}" style="border-bottom:1px solid #11181f;${f.enabled ? '' : 'opacity:.5'}">
+        <td style="padding:6px 10px"><input class="nm-f-name" value="${esc(f.name || '')}" placeholder="—" style="${INP};width:120px"/></td>
+        <td style="padding:6px 10px">${agentSelect('nm-f-src', f.srcAgent)}</td>
+        <td style="padding:6px 10px"><input class="nm-f-srcport" type="number" min="0" max="65535" value="${f.srcPort || ''}" placeholder="dynamic" style="${INP};width:74px"/></td>
+        <td style="padding:6px 10px">${protoSelect('nm-f-proto', f.protocol)}</td>
+        <td style="padding:6px 10px">${agentSelect('nm-f-dst', f.dstAgent)}</td>
+        <td style="padding:6px 10px"><input class="nm-f-dstport" type="number" min="0" max="65535" value="${icmp ? '' : (f.dstPort || '')}" placeholder="${icmp ? 'n/a' : 'port'}" ${icmp ? 'disabled' : ''} style="${INP};width:74px;${icmp ? 'opacity:.4' : ''}"/></td>
+        <td style="padding:6px 10px"><input type="checkbox" class="nm-f-enabled" ${f.enabled ? 'checked' : ''}/></td>
+        <td style="padding:6px 10px;white-space:nowrap"><button data-act="saveFlow" data-arg="${esc(f.id)}" style="font:600 10px 'IBM Plex Mono';padding:5px 9px;border-radius:5px;border:1px solid #2f6b3a;background:#13351f;color:#7ee787;margin-right:5px;cursor:pointer">Save</button><button data-act="deleteFlow" data-arg="${esc(f.id)}" style="font:600 10px 'IBM Plex Mono';padding:5px 9px;border-radius:5px;border:1px solid #5a2730;background:#2a1418;color:#f0a3a3;cursor:pointer">✕</button></td>
+      </tr>`;
+    }).join('');
+  }
+
+  function updateFlowRows() {
+    const el = document.getElementById('nm-flow-rows');
+    if (el) el.innerHTML = flowRowsHTML();
+  }
+  function flowRowEl(id) {
+    const sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+    return document.querySelector(`[data-flow="${sel}"]`);
   }
 
   function controllerDash() {
@@ -333,7 +384,7 @@
 
   function gridHTML() {
     const cols = [['src', 'SOURCE'], ['dst', 'DEST'], ['profile', 'PROFILE'], ['port', 'PORT'], ['latency', 'LAT ms'], ['jitter', 'JIT ms'], ['loss', 'LOSS %'], ['status', 'STATUS']];
-    const filters = ['ALL', 'UDP-Sym', 'UDP-Dyn', 'TCP', 'ICMP'];
+    const filters = ['ALL', 'UDP', 'TCP', 'ICMP'];
     return `<div style="flex:1.5;min-width:0;background:#0c1118;border:1px solid #1a2330;border-radius:8px;display:flex;flex-direction:column;overflow:hidden">
       <div style="flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid #161e29">
         <div style="font:600 10px/1 'IBM Plex Mono';letter-spacing:.13em;color:#6b7888">TELEMETRY · <span id="nm-rowcount">0</span> FLOWS</div>
@@ -518,7 +569,7 @@
       <div style="flex:1;min-height:0;overflow:auto;background:#0c1118;border:1px solid #1a2330;border-radius:8px">
         <table style="width:100%;border-collapse:collapse;font:500 11px 'IBM Plex Mono'">
           <thead style="position:sticky;top:0;background:#0d131c;z-index:2"><tr style="color:#5d6a7c;text-align:left">
-            ${['FRIENDLY NAME', 'AGENT ID', 'GROUP', 'DATA PORT', 'WS RTT', 'STATE', 'TRAFFIC PROFILES', 'ACTIONS'].map((h) => `<th style="padding:9px 10px;font:600 9px 'IBM Plex Mono';letter-spacing:.08em;border-bottom:1px solid #1a2330;white-space:nowrap">${h}</th>`).join('')}
+            ${['FRIENDLY NAME', 'AGENT ID', 'GROUP', 'WS RTT', 'STATE', 'LISTEN PORTS', 'ACTIONS'].map((h) => `<th style="padding:9px 10px;font:600 9px 'IBM Plex Mono';letter-spacing:.08em;border-bottom:1px solid #1a2330;white-space:nowrap">${h}</th>`).join('')}
           </tr></thead>
           <tbody id="nm-admin-rows">${adminRowsHTML()}</tbody>
         </table>
@@ -527,21 +578,18 @@
   }
 
   function adminRowsHTML() {
-    if (!S.agents.length) return `<tr><td colspan="8" style="padding:22px;text-align:center;color:#465061">no agents connected</td></tr>`;
-    const PROFS = [['udp_symmetric', 'UDP-Sym'], ['udp_dynamic', 'UDP-Dyn'], ['tcp', 'TCP'], ['icmp', 'ICMP']];
+    if (!S.agents.length) return `<tr><td colspan="7" style="padding:22px;text-align:center;color:#465061">no agents connected</td></tr>`;
     return S.agents.map((a) => {
-      const profs = a.profiles || ['udp_symmetric', 'udp_dynamic', 'tcp', 'icmp'];
       const enabled = a.enabled !== false;
       const s = statusOf((a.wsRttUs || 0) / 1000, 0);
-      const profBoxes = PROFS.map(([p, lbl]) => `<label style="display:inline-flex;align-items:center;gap:3px;margin-right:9px;color:#9fb1c6;cursor:pointer"><input type="checkbox" class="nm-prof" data-prof="${p}" ${profs.includes(p) ? 'checked' : ''}/>${lbl}</label>`).join('');
+      const ports = (a.ports || []).map((p) => `<span title="UDP ${p.udp ? 'ok' : '-'} / TCP ${p.tcp ? 'ok' : '-'}" style="margin-right:8px;color:${p.udp || p.tcp ? '#7ee787' : '#f85149'}">${p.port}<span style="color:#566273">${p.udp ? ' u' : ''}${p.tcp ? ' t' : ''}</span></span>`).join('') || '<span style="color:#465061">—</span>';
       return `<tr data-agent="${esc(a.id)}" style="border-bottom:1px solid #11181f;${enabled ? '' : 'opacity:.55'}">
         <td style="padding:7px 10px"><input class="nm-label" value="${esc(a.label || '')}" placeholder="${esc(a.id)}" style="background:#0a0e14;border:1px solid #1c2632;border-radius:5px;color:#eef3fa;font:500 11px 'IBM Plex Mono';padding:6px 8px;width:140px;outline:none"/></td>
         <td style="padding:7px 10px;color:#8b98a8;white-space:nowrap">${esc(a.id)}</td>
         <td style="padding:7px 10px"><input class="nm-group" value="${esc(a.group || '')}" placeholder="—" style="background:#0a0e14;border:1px solid #1c2632;border-radius:5px;color:#cdd9e5;font:500 11px 'IBM Plex Mono';padding:6px 8px;width:84px;outline:none"/></td>
-        <td style="padding:7px 10px;color:#7b8898">${a.dataPort || '—'}${a.testPort ? `<span title="active test port: UDP ${a.portUdp ? 'ok' : 'fail'} / TCP ${a.portTcp ? 'ok' : 'fail'}" style="margin-left:7px;font-size:10px;color:${a.portUdp && a.portTcp ? '#7ee787' : '#d29922'}">▸${a.testPort} ${a.portUdp && a.portTcp ? '✓' : '!'}</span>` : ''}</td>
         <td style="padding:7px 10px;color:#cdd9e5">${((a.wsRttUs || 0) / 1000).toFixed(1)}ms</td>
         <td style="padding:7px 10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:${enabled ? colorFor(s) : '#566273'}"><input type="checkbox" class="nm-enabled" ${enabled ? 'checked' : ''}/><span style="width:6px;height:6px;border-radius:50%;background:${enabled ? colorFor(s) : '#3a4757'};${enabled ? 'box-shadow:0 0 5px ' + colorFor(s) : ''}"></span>${enabled ? 'enabled' : 'disabled'}</label></td>
-        <td style="padding:7px 10px;white-space:nowrap">${profBoxes}</td>
+        <td style="padding:7px 10px;white-space:nowrap;color:#9fb1c6">${ports}</td>
         <td style="padding:7px 10px;white-space:nowrap"><button data-act="saveAgent" data-arg="${esc(a.id)}" style="font:600 10px 'IBM Plex Mono';padding:6px 11px;border-radius:5px;border:1px solid #2f6b3a;background:#13351f;color:#7ee787;margin-right:6px;cursor:pointer">Save</button><button data-act="evictAgent" data-arg="${esc(a.id)}" style="font:600 10px 'IBM Plex Mono';padding:6px 11px;border-radius:5px;border:1px solid #5a2730;background:#2a1418;color:#f0a3a3;cursor:pointer">Evict</button></td>
       </tr>`;
     }).join('');
@@ -839,7 +887,7 @@
         ${miniStat('WS LATENCY', lat.toFixed(1), ' ms')}${miniStat('LOSS', loss.toFixed(2), ' %')}${miniStat('TESTS', dp.length, '')}
         ${miniStat('FRAMES RX', a ? a.framesRx || 0 : 0, '')}${miniStat('FRAMES TX', a ? a.framesTx || 0 : 0, '')}${miniStat('LAST SEQ', a ? a.lastSeq || 0 : 0, '')}
       </div>
-      ${a && a.testPort ? `<div style="flex:0 0 auto;padding:0 16px 10px"><div style="display:flex;align-items:center;gap:8px;background:#0e141d;border:1px solid #1a2330;border-radius:7px;padding:9px 11px;font:500 10px 'IBM Plex Mono'"><span style="color:#5d6a7c;letter-spacing:.08em">DATA-PLANE PORT</span><b style="color:#cdd9e5">${a.testPort}</b><div style="flex:1"></div><span style="color:${a.portUdp ? '#7ee787' : '#f85149'}">UDP ${a.portUdp ? '✓' : '✕'}</span><span style="color:${a.portTcp ? '#7ee787' : '#f85149'}">TCP ${a.portTcp ? '✓' : '✕'}</span></div></div>` : ''}
+      ${a && a.ports && a.ports.length ? `<div style="flex:0 0 auto;padding:0 16px 10px"><div style="display:flex;align-items:center;gap:10px;background:#0e141d;border:1px solid #1a2330;border-radius:7px;padding:9px 11px;font:500 10px 'IBM Plex Mono';flex-wrap:wrap"><span style="color:#5d6a7c;letter-spacing:.08em">LISTEN PORTS</span>${a.ports.map((p) => `<span style="color:${p.udp || p.tcp ? '#7ee787' : '#f85149'}">${p.port}<span style="color:#566273">${p.udp ? ' udp' : ''}${p.tcp ? ' tcp' : ''}</span></span>`).join('')}</div></div>` : ''}
       <div style="flex:0 0 auto;padding:4px 16px 8px;font:600 9px 'IBM Plex Mono';letter-spacing:.12em;color:#5d6a7c">TESTS &amp; FLOWS — click for probe detail</div>
       <div style="flex:1;min-height:0;overflow:auto;padding:0 12px 12px">
         ${flows.map((f) => { const st = statusOf(f.latency, f.loss); const pm = PROF[f.profile] || ['#8b98a8', '#8b98a844']; const peer = f.ctrl ? 'controller' : (f.src === id ? f.dst : f.src); const dir = f.ctrl ? 'WS·CTRL' : (f.src === id ? 'OUT →' : '← IN'); return `<button data-act="openTest" data-arg="${esc(f.id)}" style="width:100%;text-align:left;display:flex;align-items:center;gap:10px;background:#0d131c;border:1px solid #18212d;border-radius:7px;padding:9px 11px;margin-bottom:6px"><span style="font:600 8px 'IBM Plex Mono';color:${f.ctrl ? P.accent : '#7b8898'};width:42px;flex:0 0 auto">${dir}</span><span style="font:600 11px 'IBM Plex Mono';color:#cdd9e5;flex:1;min-width:0">${esc(peer)}</span><span style="color:${pm[0]};border:1px solid ${pm[1]};padding:1px 6px;border-radius:4px;font:500 9px 'IBM Plex Mono'">${esc(f.profile)}</span><span style="font:500 10px 'IBM Plex Mono';color:#8b98a8;width:50px;text-align:right">${f.latency.toFixed(1)}ms</span><span style="width:7px;height:7px;border-radius:50%;background:${colorFor(st)};box-shadow:0 0 5px ${colorFor(st)};flex:0 0 auto"></span><span style="color:#465061;font-size:13px">›</span></button>`; }).join('')}
@@ -980,6 +1028,54 @@
     goDash: () => { S.page = 'dashboard'; render(); },
     goSeq: () => { S.page = 'sequences'; render(); },
     goAdmin: () => { S.page = 'admin'; render(); },
+    goTraffic: () => { S.page = 'traffic'; render(); fetchFlows().then(updateFlowRows); },
+    startTest: async () => { if (readOnly()) return loginPrompt(); if (S.running) return; const r = await postJSON('/api/tests/start', { intervalMs: S.txInterval }); if (r.ok) setRunning(true); else alert('Start failed: ' + (await r.text())); },
+    addFlow: async () => {
+      if (readOnly()) return loginPrompt();
+      const g = (c) => document.querySelector('.' + c);
+      const proto = g('nm-nf-proto').value;
+      const body = {
+        name: g('nm-nf-name').value.trim(),
+        srcAgent: g('nm-nf-src').value,
+        srcPort: parseInt(g('nm-nf-srcport').value || '0', 10) || 0,
+        protocol: proto,
+        dstAgent: g('nm-nf-dst').value,
+        dstPort: proto === 'icmp' ? 0 : (parseInt(g('nm-nf-dstport').value || '0', 10) || 0),
+        enabled: true,
+      };
+      if (!body.srcAgent || !body.dstAgent) { alert('pick a source and destination agent'); return; }
+      if (body.srcAgent === body.dstAgent) { alert('source and destination agent must differ'); return; }
+      if (proto !== 'icmp' && !body.dstPort) { alert('a destination port is required for UDP/TCP'); return; }
+      const r = await postJSON('/api/flows/upsert', body);
+      if (r.ok) { await fetchFlows(); updateFlowRows(); ['nm-nf-name', 'nm-nf-srcport', 'nm-nf-dstport'].forEach((c) => { const e = g(c); if (e) e.value = ''; }); }
+      else alert('Add failed: ' + (await r.text()));
+    },
+    saveFlow: async (id) => {
+      const row = flowRowEl(id); if (!row) return;
+      const q = (c) => row.querySelector('.' + c);
+      const proto = q('nm-f-proto').value;
+      const body = {
+        id, name: q('nm-f-name').value.trim(),
+        srcAgent: q('nm-f-src').value, srcPort: parseInt(q('nm-f-srcport').value || '0', 10) || 0,
+        protocol: proto, dstAgent: q('nm-f-dst').value,
+        dstPort: proto === 'icmp' ? 0 : (parseInt(q('nm-f-dstport').value || '0', 10) || 0),
+        enabled: q('nm-f-enabled').checked,
+      };
+      if (!body.srcAgent || !body.dstAgent) { alert('pick a source and destination agent'); return; }
+      if (body.srcAgent === body.dstAgent) { alert('source and destination agent must differ'); return; }
+      if (proto !== 'icmp' && !body.dstPort) { alert('a destination port is required for UDP/TCP'); return; }
+      const r = await postJSON('/api/flows/upsert', body);
+      if (r.ok) { await fetchFlows(); updateFlowRows(); } else alert('Save failed: ' + (await r.text()));
+    },
+    deleteFlow: async (id) => { const r = await postJSON('/api/flows/delete', { id }); if (r.ok) { await fetchFlows(); updateFlowRows(); } },
+    clearFlows: async () => { if (!confirm('Delete all traffic flows?')) return; const r = await postJSON('/api/flows/clear', {}); if (r.ok) { await fetchFlows(); updateFlowRows(); } },
+    genMesh: async () => {
+      const port = parseInt((document.getElementById('nm-mesh-port') || {}).value || '0', 10) || 0;
+      const protocols = [...document.querySelectorAll('.nm-mesh-proto')].filter((c) => c.checked).map((c) => c.getAttribute('data-prof'));
+      const symmetric = (document.getElementById('nm-mesh-sym') || {}).checked || false;
+      const r = await postJSON('/api/flows/mesh', { port, protocols, symmetric });
+      if (r.ok) { await fetchFlows(); updateFlowRows(); } else alert('Mesh failed: ' + (await r.text()));
+    },
     maximizeLog: () => { S.logMax = true; render(); },
     closeLogMax: () => { S.logMax = false; render(); },
     toggleLogPause: () => { if (S.logPaused) resumeLog(); else { S.logPaused = true; updateLogChrome(); } },
@@ -990,13 +1086,11 @@
     refreshAdmin: async () => { await refresh(); updateAdminRows(); },
     saveAgent: async (id) => {
       const row = adminRow(id); if (!row) return;
-      const profiles = [...row.querySelectorAll('.nm-prof')].filter((c) => c.checked).map((c) => c.getAttribute('data-prof'));
       const body = {
         agentId: id,
         label: row.querySelector('.nm-label').value.trim(),
         group: row.querySelector('.nm-group').value.trim(),
         enabled: row.querySelector('.nm-enabled').checked,
-        profiles,
       };
       const r = await postJSON('/api/admin/agents', body);
       if (r.ok) { await refresh(); updateAdminRows(); } else { alert('Save failed: ' + (await r.text())); }
@@ -1006,17 +1100,6 @@
       const r = await postJSON('/api/admin/agents/evict', { agentId: id });
       if (!r.ok) { alert('Evict failed: ' + (await r.text())); return; }
       setTimeout(async () => { await refresh(); updateAdminRows(); }, 700);
-    },
-    openTestSetup: () => { if (readOnly()) return loginPrompt(); if (S.running) return; S.testSetup = true; render(); },
-    closeTestSetup: () => { S.testSetup = false; render(); },
-    runTest: async () => {
-      if (readOnly()) return loginPrompt();
-      const port = parseInt((document.getElementById('nm-test-port') || {}).value || '0', 10) || 0;
-      const interval = parseInt((document.getElementById('nm-test-interval') || {}).value || S.txInterval, 10) || S.txInterval;
-      const protocols = [...document.querySelectorAll('.nm-test-proto')].filter((c) => c.checked).map((c) => c.getAttribute('data-prof'));
-      S.txInterval = interval; S.testPort = port;
-      const r = await postJSON('/api/tests/start', { port, protocols, intervalMs: interval });
-      if (r.ok) { S.testSetup = false; S.running = true; render(); } else { alert('Start failed: ' + (await r.text())); }
     },
     stopTest: async () => { if (readOnly()) return loginPrompt(); if (!S.running) return; const r = await postJSON('/api/tests/stop', {}); if (r.ok) setRunning(false); },
     setTx: (e) => { S.txInterval = +e.target.value; updateClock(); },
@@ -1068,10 +1151,27 @@
     if (A[act]) { e.preventDefault(); A[act](arg); }
   });
   app.addEventListener('input', (e) => { const el = e.target.closest('[data-act]'); if (!el) return; const act = el.getAttribute('data-act'); if (act === 'setTx' || act === 'setQuery' || act === 'logQuery') A[act](e); });
+  // Switching a flow's protocol to ICMP live-toggles its (now meaningless) DST PORT field.
+  app.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.classList.contains('nm-f-proto')) { const row = t.closest('tr'); if (row) toggleDstPort(t.value, row.querySelector('.nm-f-dstport')); }
+    else if (t.classList.contains('nm-nf-proto')) { toggleDstPort(t.value, document.querySelector('.nm-nf-dstport')); }
+  });
+  function toggleDstPort(proto, inp) {
+    if (!inp) return;
+    const icmp = proto === 'icmp';
+    inp.disabled = icmp;
+    inp.placeholder = icmp ? 'n/a' : 'port';
+    inp.style.opacity = icmp ? '.4' : '';
+    if (icmp) inp.value = '';
+  }
 
   // ================= boot =================
   async function fetchInfo() {
     try { const info = await getJSON('/api/info'); S.info = Object.assign(S.info, info); if (typeof info.testRunning === 'boolean') S.running = info.testRunning; } catch (e) { }
+  }
+  async function fetchFlows() {
+    try { S.trafficFlows = (await getJSON('/api/flows')) || []; } catch (e) { }
   }
   async function boot() {
     await fetchInfo();

@@ -17,16 +17,16 @@ import (
 
 // portDetail renders a human-readable summary of a port-availability report.
 func portDetail(ps protocol.PortStatus) string {
-	d := "port " + strconv.Itoa(ps.Port) + " unavailable ("
+	d := "port " + strconv.Itoa(ps.Port) + " ("
 	if ps.UDP {
 		d += "udp ok, "
 	} else {
-		d += "udp FAIL, "
+		d += "udp -, "
 	}
 	if ps.TCP {
 		d += "tcp ok)"
 	} else {
-		d += "tcp FAIL)"
+		d += "tcp -)"
 	}
 	if ps.Err != "" {
 		d += " — " + ps.Err
@@ -58,10 +58,8 @@ type AgentInfo struct {
 	WSRttMicros int64  `json:"wsRttUs"`
 	FramesRx    uint64 `json:"framesRx"`
 	FramesTx    uint64 `json:"framesTx"`
-	// Last reported data-plane test-port bind status.
-	TestPort int  `json:"testPort"`
-	PortUDP  bool `json:"portUdp"`
-	PortTCP  bool `json:"portTcp"`
+	// Last reported data-plane listen-port bind status (one per assigned port).
+	Ports []protocol.PortStatus `json:"ports,omitempty"`
 }
 
 // Hub is the Controller-side registry of connected agents. It performs
@@ -266,9 +264,7 @@ func (h *Hub) Agents() []AgentInfo {
 			WSRttMicros: ac.peer.RTTMicros(),
 			FramesRx:    ac.peer.FramesRx(),
 			FramesTx:    ac.peer.FramesTx(),
-			TestPort:    ps.Port,
-			PortUDP:     ps.UDP,
-			PortTCP:     ps.TCP,
+			Ports:       ps,
 		})
 	}
 	return out
@@ -288,11 +284,11 @@ type AgentConn struct {
 	remoteAddr string
 	joinedAt   time.Time
 
-	mu      sync.RWMutex
-	id      string
-	host    string
-	dport   int
-	pstatus protocol.PortStatus
+	mu    sync.RWMutex
+	id    string
+	host  string
+	dport int
+	ports []protocol.PortStatus
 }
 
 func (ac *AgentConn) agentID() string {
@@ -313,10 +309,10 @@ func (ac *AgentConn) dataPort() int {
 	return ac.dport
 }
 
-func (ac *AgentConn) portStatus() protocol.PortStatus {
+func (ac *AgentConn) portStatus() []protocol.PortStatus {
 	ac.mu.RLock()
 	defer ac.mu.RUnlock()
-	return ac.pstatus
+	return ac.ports
 }
 
 // onMessage dispatches frames received from this agent.
@@ -359,21 +355,23 @@ func (ac *AgentConn) onMessage(env protocol.Envelope) {
 		}
 
 	case protocol.TypePortStatus:
-		var ps protocol.PortStatus
-		if err := env.DecodePayload(&ps); err != nil {
+		var rep protocol.PortReport
+		if err := env.DecodePayload(&rep); err != nil {
 			ac.hub.log.Warnf("transport: bad PORT_STATUS", "err", err)
 			return
 		}
 		ac.mu.Lock()
-		ac.pstatus = ps
+		ac.ports = rep.Ports
 		ac.mu.Unlock()
 		id := ac.agentID()
-		if ps.UDP && ps.TCP {
-			ac.hub.log.Emit(logging.Event{Type: logging.PortBound, AgentID: id,
-				Detail: "port " + strconv.Itoa(ps.Port) + " bound (udp+tcp)", Fields: map[string]any{"port": ps.Port}})
-		} else {
-			ac.hub.log.Emit(logging.Event{Type: logging.PortUnavailable, AgentID: id,
-				Detail: portDetail(ps), Fields: map[string]any{"port": ps.Port, "udp": ps.UDP, "tcp": ps.TCP}})
+		for _, ps := range rep.Ports {
+			if ps.UDP || ps.TCP {
+				ac.hub.log.Emit(logging.Event{Type: logging.PortBound, AgentID: id,
+					Detail: portDetail(ps), Fields: map[string]any{"port": ps.Port}})
+			} else {
+				ac.hub.log.Emit(logging.Event{Type: logging.PortUnavailable, AgentID: id,
+					Detail: portDetail(ps), Fields: map[string]any{"port": ps.Port}})
+			}
 		}
 
 	case protocol.TypeEvent:

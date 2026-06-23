@@ -4,32 +4,27 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
-
-	"netmesh/internal/protocol"
 )
 
 // AgentConfig is operator-managed metadata for an agent: a friendly label, a
-// group, whether it participates in the mesh, and which traffic profiles it
-// generates. Defaults: enabled, all profiles.
+// group, and whether it participates in tests. Default: enabled.
 type AgentConfig struct {
-	Label    string             `json:"label"`
-	Group    string             `json:"group"`
-	Enabled  bool               `json:"enabled"`
-	Profiles []protocol.Profile `json:"profiles"`
+	Label   string `json:"label"`
+	Group   string `json:"group"`
+	Enabled bool   `json:"enabled"`
 }
 
 func defaultConfig() AgentConfig {
-	return AgentConfig{Enabled: true, Profiles: append([]protocol.Profile(nil), protocol.AllProfiles...)}
+	return AgentConfig{Enabled: true}
 }
 
 // AgentUpdate is a partial update to an agent's config; nil fields are left
 // unchanged.
 type AgentUpdate struct {
-	AgentID  string              `json:"agentId"`
-	Label    *string             `json:"label"`
-	Group    *string             `json:"group"`
-	Enabled  *bool               `json:"enabled"`
-	Profiles *[]protocol.Profile `json:"profiles"`
+	AgentID string  `json:"agentId"`
+	Label   *string `json:"label"`
+	Group   *string `json:"group"`
+	Enabled *bool   `json:"enabled"`
 }
 
 // adminStore holds per-agent operator config, persisted best-effort to a JSON
@@ -78,9 +73,6 @@ func (s *adminStore) get(id string) AgentConfig {
 	if !ok {
 		return defaultConfig()
 	}
-	if c.Profiles == nil {
-		c.Profiles = defaultConfig().Profiles
-	}
 	return c
 }
 
@@ -99,15 +91,6 @@ func (s *adminStore) update(u AgentUpdate) AgentConfig {
 	}
 	if u.Enabled != nil {
 		c.Enabled = *u.Enabled
-	}
-	if u.Profiles != nil {
-		valid := make([]protocol.Profile, 0, len(*u.Profiles))
-		for _, p := range *u.Profiles {
-			if p.Valid() {
-				valid = append(valid, p)
-			}
-		}
-		c.Profiles = valid
 	}
 	s.cfg[u.AgentID] = c
 	s.mu.Unlock()

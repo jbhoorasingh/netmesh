@@ -6,8 +6,9 @@
 # Editor / OS
 .DS_Store
 .idea/
-# Admin config persistence
+# Admin / flow config persistence
 netmesh-admin.json
+netmesh-flows.json
 # Release build output
 /dist/
 # Local Claude Code / tooling config (shared .claude/settings.json IS tracked)

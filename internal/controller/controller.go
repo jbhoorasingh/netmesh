@@ -48,13 +48,12 @@ type Controller struct {
 	uiToken string // disclosed only to authenticated callers; privileges a /ws/ui session
 
 	admin *adminStore
+	flows *flowStore
 
 	running     atomic.Bool  // whether a test is currently active
 	curInterval atomic.Int64 // interval of the active test (for re-applying config)
-	curPort     atomic.Int64 // data-plane port of the active test
 
-	curMu        sync.Mutex
-	curProtocols []protocol.Profile // protocols of the active test
+	applyMu sync.Mutex // serializes applyFlows so per-agent control frames stay ordered
 
 	flowMu       sync.Mutex
 	flowStatus   map[string]string // last emitted status per flow (for transition events)
@@ -71,6 +70,7 @@ func New(cfg *config.Config, log *logging.Logger) *Controller {
 		ui:           uistream.NewHub(),
 		uiToken:      randomToken(),
 		admin:        newAdminStore("netmesh-admin.json"),
+		flows:        newFlowStore("netmesh-flows.json"),
 		flowStatus:   make(map[string]string),
 		flowLastEmit: make(map[string]int64),
 	}
@@ -127,11 +127,15 @@ func (c *Controller) routes() http.Handler {
 	mux.HandleFunc("/api/auth", c.handleAuthInfo)
 	mux.HandleFunc("/api/agents", c.handleAgents)
 	mux.HandleFunc("/api/metrics", c.handleMetrics)
+	mux.HandleFunc("/api/flows", c.handleFlowsList) // GET — read-only flow list
 
 	// Privileged surfaces — require credentials when secured.
 	mux.Handle("/api/tests/start", c.auth.RequireWriteFunc(c.handleTestStart))
 	mux.Handle("/api/tests/stop", c.auth.RequireWriteFunc(c.handleTestStop))
-	mux.Handle("/api/routing", c.auth.RequireWriteFunc(c.handleRouting))
+	mux.Handle("/api/flows/upsert", c.auth.RequireWriteFunc(c.handleFlowUpsert))
+	mux.Handle("/api/flows/delete", c.auth.RequireWriteFunc(c.handleFlowDelete))
+	mux.Handle("/api/flows/mesh", c.auth.RequireWriteFunc(c.handleFlowsMesh))
+	mux.Handle("/api/flows/clear", c.auth.RequireWriteFunc(c.handleFlowsClear))
 	mux.Handle("/api/diag", c.auth.RequireWriteFunc(c.handleDiag))
 	mux.Handle("/api/admin/agents", c.auth.RequireWriteFunc(c.handleAdminUpdate))
 	mux.Handle("/api/admin/agents/evict", c.auth.RequireWriteFunc(c.handleAdminEvict))
@@ -208,10 +212,9 @@ func (c *Controller) handleAuthInfo(w http.ResponseWriter, r *http.Request) {
 // agentView is a connected agent merged with its operator-managed config.
 type agentView struct {
 	transport.AgentInfo
-	Label    string             `json:"label"`
-	Group    string             `json:"group"`
-	Enabled  bool               `json:"enabled"`
-	Profiles []protocol.Profile `json:"profiles"`
+	Label   string `json:"label"`
+	Group   string `json:"group"`
+	Enabled bool   `json:"enabled"`
 }
 
 func (c *Controller) handleAgents(w http.ResponseWriter, r *http.Request) {
@@ -219,7 +222,7 @@ func (c *Controller) handleAgents(w http.ResponseWriter, r *http.Request) {
 	views := make([]agentView, 0, len(infos))
 	for _, ai := range infos {
 		cfg := c.admin.get(ai.ID)
-		views = append(views, agentView{AgentInfo: ai, Label: cfg.Label, Group: cfg.Group, Enabled: cfg.Enabled, Profiles: cfg.Profiles})
+		views = append(views, agentView{AgentInfo: ai, Label: cfg.Label, Group: cfg.Group, Enabled: cfg.Enabled})
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -236,9 +239,9 @@ func (c *Controller) handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
 	cfg := c.admin.update(u)
 	c.log.Emit(logging.Event{Type: logging.AgentConfigUpdated, AgentID: u.AgentID,
 		Detail: adminDetail(cfg), Fields: map[string]any{"enabled": cfg.Enabled, "label": cfg.Label, "group": cfg.Group}})
-	// If a test is live, re-apply so enable/disable and profile changes take effect now.
+	// If a test is live, re-apply so enable/disable takes effect now.
 	if c.running.Load() {
-		c.startMesh(c.curInterval.Load(), int(c.curPort.Load()), c.currentProtocols())
+		c.applyFlows(c.curInterval.Load())
 	}
 	writeJSON(w, http.StatusOK, cfg)
 }
@@ -263,14 +266,7 @@ func adminDetail(cfg AgentConfig) string {
 	if !cfg.Enabled {
 		state = "disabled"
 	}
-	profs := make([]string, 0, len(cfg.Profiles))
-	for _, p := range cfg.Profiles {
-		profs = append(profs, profDisplay(p))
-	}
 	d := "config updated · " + state
-	if len(profs) > 0 {
-		d += " · " + strings.Join(profs, ",")
-	}
 	if cfg.Label != "" {
 		d += " · \"" + cfg.Label + "\""
 	}
@@ -281,17 +277,103 @@ func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c.store.Snapshot())
 }
 
-// startRequest is the (optional) body for POST /api/tests/start. With no body,
-// the controller auto-builds a full mesh across the connected agents using each
-// agent's default data port and configured profiles.
+// --- Flows -----------------------------------------------------------------
+
+func (c *Controller) handleFlowsList(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, c.flows.all())
+}
+
+func (c *Controller) handleFlowUpsert(w http.ResponseWriter, r *http.Request) {
+	var f Flow
+	if !decodeJSON(w, r, &f) {
+		return
+	}
+	if f.SrcAgent == "" || f.DstAgent == "" || !f.Protocol.Valid() {
+		http.Error(w, "srcAgent, dstAgent and a valid protocol are required", http.StatusBadRequest)
+		return
+	}
+	if f.SrcAgent == f.DstAgent {
+		http.Error(w, "source and destination agent must differ", http.StatusBadRequest)
+		return
+	}
+	if f.Protocol.HasPorts() && f.DstPort <= 0 {
+		http.Error(w, "a destination port is required for UDP/TCP flows", http.StatusBadRequest)
+		return
+	}
+	saved := c.flows.upsert(f)
+	c.reapplyIfRunning()
+	writeJSON(w, http.StatusOK, saved)
+}
+
+func (c *Controller) handleFlowDelete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	c.flows.remove(body.ID)
+	c.reapplyIfRunning()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "id": body.ID})
+}
+
+func (c *Controller) handleFlowsClear(w http.ResponseWriter, r *http.Request) {
+	c.flows.clear()
+	c.reapplyIfRunning()
+	writeJSON(w, http.StatusOK, map[string]any{"status": "cleared"})
+}
+
+// handleFlowsMesh appends a full mesh of flows across the connected agents.
+func (c *Controller) handleFlowsMesh(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Port      int                `json:"port"`
+		Protocols []protocol.Profile `json:"protocols"`
+		Symmetric bool               `json:"symmetric"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.Protocols) == 0 {
+		req.Protocols = protocol.AllProfiles
+	}
+	agents := c.hub.Agents()
+	added := 0
+	for _, a := range agents {
+		for _, b := range agents {
+			if a.ID == b.ID {
+				continue
+			}
+			for _, proto := range req.Protocols {
+				if !proto.Valid() {
+					continue
+				}
+				f := Flow{SrcAgent: a.ID, DstAgent: b.ID, Protocol: proto, Enabled: true}
+				if proto.HasPorts() {
+					f.DstPort = req.Port
+					if req.Symmetric {
+						f.SrcPort = req.Port
+					}
+				}
+				c.flows.add(f)
+				added++
+			}
+		}
+	}
+	c.reapplyIfRunning()
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "mesh-generated", "added": added})
+}
+
+func (c *Controller) reapplyIfRunning() {
+	if c.running.Load() {
+		c.applyFlows(c.curInterval.Load())
+	}
+}
+
+// --- Test lifecycle --------------------------------------------------------
+
+// startRequest is the (optional) body for POST /api/tests/start.
 type startRequest struct {
-	Routing    protocol.RoutingTable `json:"routing"`
-	Spec       protocol.TestSpec     `json:"spec"`
-	IntervalMS int64                 `json:"intervalMs"`
-	// Master-driven test setup: the data-plane port to bind/probe (0 = each
-	// agent's default), and which protocols to run (empty = per-agent config).
-	Port      int                `json:"port"`
-	Protocols []protocol.Profile `json:"protocols"`
+	IntervalMS int64 `json:"intervalMs"`
 }
 
 func (c *Controller) handleTestStart(w http.ResponseWriter, r *http.Request) {
@@ -301,124 +383,18 @@ func (c *Controller) handleTestStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	interval := req.Spec.IntervalMS
-	if interval <= 0 {
-		interval = req.IntervalMS
-	}
+	interval := req.IntervalMS
 	if interval <= 0 {
 		interval = 250
 	}
 
 	c.resetFlows()
-	c.curInterval.Store(interval)
 	c.running.Store(true)
-
-	var runID string
-	var agents int
-	if len(req.Routing.Peers) > 0 {
-		// Explicit routing table supplied: broadcast it verbatim (advanced use).
-		if req.Spec.RunID == "" {
-			req.Spec = protocol.TestSpec{RunID: "run-" + time.Now().Format("150405"), IntervalMS: interval, PayloadSize: 64}
-		}
-		c.hub.Broadcast(protocol.TypeRouting, req.Routing)
-		c.hub.Broadcast(protocol.TypeTestStart, req.Spec)
-		runID, agents = req.Spec.RunID, len(req.Routing.Peers)
-	} else {
-		runID, agents = c.startMesh(interval, req.Port, req.Protocols)
-	}
+	runID, flows := c.applyFlows(interval)
 
 	c.log.Emit(logging.Event{Type: logging.TestStarted, Detail: runID,
-		Fields: map[string]any{"intervalMs": interval, "agents": agents, "port": req.Port}})
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "started", "runId": runID, "agents": agents})
-}
-
-// startMesh sends each enabled agent a routing table of the other enabled
-// agents (probed with that agent's configured profiles) plus a TEST_START.
-// Disabled agents are told to stop. Returns the run id and number of agents
-// started. It is also called to re-apply config changes mid-run.
-func (c *Controller) startMesh(intervalMs int64, port int, protocols []protocol.Profile) (string, int) {
-	// Remember the test config so an admin change can re-apply it mid-run.
-	c.curPort.Store(int64(port))
-	c.setProtocols(protocols)
-
-	runID := "run-" + time.Now().Format("150405")
-	spec := protocol.TestSpec{RunID: runID, IntervalMS: intervalMs, PayloadSize: 64, Port: port}
-	epoch := uint64(time.Now().Unix())
-
-	// Resolve a dialable address per enabled agent: a master-chosen port applies
-	// mesh-wide; otherwise each agent's own advertised data port is used.
-	type addr struct{ id, address string }
-	infos := c.hub.Agents()
-	var enabled []addr
-	for _, a := range infos {
-		if !c.admin.get(a.ID).Enabled {
-			continue
-		}
-		host, _, err := net.SplitHostPort(a.RemoteAddr)
-		if err != nil {
-			host = a.RemoteAddr
-		}
-		p := port
-		if p <= 0 {
-			if p = a.DataPort; p == 0 {
-				p = c.cfg.Port + 1
-			}
-		}
-		enabled = append(enabled, addr{a.ID, net.JoinHostPort(host, strconv.Itoa(p))})
-	}
-
-	started := 0
-	for _, a := range infos {
-		cfg := c.admin.get(a.ID)
-		profiles := intersectProfiles(protocols, cfg.Profiles)
-		if !cfg.Enabled || len(profiles) == 0 {
-			_ = c.hub.SendTo(a.ID, protocol.TypeTestStop, nil)
-			continue
-		}
-		peers := make([]protocol.Peer, 0, len(enabled))
-		for _, pa := range enabled {
-			if pa.id == a.ID {
-				continue
-			}
-			peers = append(peers, protocol.Peer{AgentID: pa.id, Address: pa.address, Profiles: profiles})
-		}
-		_ = c.hub.SendTo(a.ID, protocol.TypeRouting, protocol.RoutingTable{Epoch: epoch, Peers: peers})
-		_ = c.hub.SendTo(a.ID, protocol.TypeTestStart, spec)
-		started++
-	}
-	return runID, started
-}
-
-// intersectProfiles restricts the test-selected protocols to those an agent is
-// configured to run. An empty selection means "all the agent's profiles".
-func intersectProfiles(selected, agentProfiles []protocol.Profile) []protocol.Profile {
-	if len(selected) == 0 {
-		return agentProfiles
-	}
-	allow := make(map[protocol.Profile]bool, len(agentProfiles))
-	for _, p := range agentProfiles {
-		allow[p] = true
-	}
-	out := make([]protocol.Profile, 0, len(selected))
-	for _, p := range selected {
-		if allow[p] {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func (c *Controller) setProtocols(p []protocol.Profile) {
-	c.curMu.Lock()
-	c.curProtocols = p
-	c.curMu.Unlock()
-}
-
-func (c *Controller) currentProtocols() []protocol.Profile {
-	c.curMu.Lock()
-	defer c.curMu.Unlock()
-	return c.curProtocols
+		Fields: map[string]any{"intervalMs": interval, "flows": flows}})
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "started", "runId": runID, "flows": flows})
 }
 
 func (c *Controller) handleTestStop(w http.ResponseWriter, r *http.Request) {
@@ -429,14 +405,119 @@ func (c *Controller) handleTestStop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "stopped"})
 }
 
-func (c *Controller) handleRouting(w http.ResponseWriter, r *http.Request) {
-	var table protocol.RoutingTable
-	if !decodeJSON(w, r, &table) {
-		return
+// applyFlows builds and sends a per-agent FlowPlan (listen ports + flows to
+// generate) plus a TEST_START to every connected, enabled agent. Disabled
+// agents are told to stop. Returns the run id and the total flow count.
+//
+// applyMu serializes the whole operation so two concurrent callers (e.g. an
+// operator pressing Start while an admin toggle re-applies) cannot interleave
+// each agent's FlowPlan→TestStart frames. Flow plans are delivered to every
+// destination first, then TestStart is sent, so destinations have bound their
+// listen ports before any source begins probing them.
+func (c *Controller) applyFlows(intervalMs int64) (string, int) {
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+
+	c.curInterval.Store(intervalMs)
+	runID := "run-" + time.Now().Format("150405")
+	spec := protocol.TestSpec{RunID: runID, IntervalMS: intervalMs, PayloadSize: 64}
+
+	plans, total := c.buildFlowPlans()
+	agents := c.hub.Agents()
+
+	// Pass 1: deliver flow plans (and stop disabled agents) so every destination
+	// binds its listen ports before any source is told to start.
+	for _, a := range agents {
+		if !c.admin.get(a.ID).Enabled {
+			_ = c.hub.SendTo(a.ID, protocol.TypeTestStop, nil)
+			continue
+		}
+		_ = c.hub.SendTo(a.ID, protocol.TypeFlowPlan, plans[a.ID]) // empty plan resets the agent
 	}
-	c.hub.Broadcast(protocol.TypeRouting, table)
-	c.log.Emit(logging.Event{Type: logging.RoutingUpdated, Fields: map[string]any{"peers": len(table.Peers), "epoch": table.Epoch}})
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "routing-updated"})
+	// Pass 2: start the tests.
+	for _, a := range agents {
+		if c.admin.get(a.ID).Enabled {
+			_ = c.hub.SendTo(a.ID, protocol.TypeTestStart, spec)
+		}
+	}
+	return runID, total
+}
+
+// buildFlowPlans resolves the operator's flows into a per-agent FlowPlan: the
+// ports each agent must listen on (as a destination) and the flows it
+// originates (as a source), with destinations resolved to addresses. Flows
+// whose endpoints are not both connected+enabled are skipped. Returns the plans
+// keyed by agent ID and the total resolved flow count.
+func (c *Controller) buildFlowPlans() (map[string]protocol.FlowPlan, int) {
+	epoch := uint64(time.Now().Unix())
+	ipByID := make(map[string]string)
+	enabled := make(map[string]bool)
+	for _, a := range c.hub.Agents() {
+		host, _, err := net.SplitHostPort(a.RemoteAddr)
+		if err != nil {
+			host = a.RemoteAddr
+		}
+		ipByID[a.ID] = host
+		enabled[a.ID] = c.admin.get(a.ID).Enabled
+	}
+
+	type buildPlan struct {
+		flows  []protocol.AgentFlow
+		listen map[int]*protocol.ListenPort
+	}
+	plans := make(map[string]*buildPlan)
+	get := func(id string) *buildPlan {
+		if plans[id] == nil {
+			plans[id] = &buildPlan{listen: make(map[int]*protocol.ListenPort)}
+		}
+		return plans[id]
+	}
+
+	total := 0
+	for _, f := range c.flows.all() {
+		if !f.Enabled || f.SrcAgent == f.DstAgent || !enabled[f.SrcAgent] || !enabled[f.DstAgent] {
+			continue
+		}
+		dstIP, ok := ipByID[f.DstAgent]
+		if !ok {
+			continue
+		}
+		if _, ok := ipByID[f.SrcAgent]; !ok {
+			continue
+		}
+		dstAddr := dstIP
+		if f.Protocol.HasPorts() {
+			dstAddr = net.JoinHostPort(dstIP, strconv.Itoa(f.DstPort))
+		}
+		get(f.SrcAgent).flows = append(get(f.SrcAgent).flows, protocol.AgentFlow{
+			ID: f.ID, SrcPort: f.SrcPort, Protocol: f.Protocol,
+			DstAgent: f.DstAgent, DstAddr: dstAddr, DstPort: f.DstPort,
+		})
+		if f.Protocol.HasPorts() {
+			dst := get(f.DstAgent)
+			lp := dst.listen[f.DstPort]
+			if lp == nil {
+				lp = &protocol.ListenPort{Port: f.DstPort}
+				dst.listen[f.DstPort] = lp
+			}
+			if f.Protocol == protocol.UDP {
+				lp.UDP = true
+			} else if f.Protocol == protocol.TCP {
+				lp.TCP = true
+			}
+		}
+		total++
+	}
+
+	out := make(map[string]protocol.FlowPlan)
+	for id, bp := range plans {
+		fp := protocol.FlowPlan{Epoch: epoch, Flows: bp.flows}
+		for _, lp := range bp.listen {
+			fp.ListenPorts = append(fp.ListenPorts, *lp)
+		}
+		out[id] = fp
+	}
+	return out, total
 }
 
 // diagRequest is the body for POST /api/diag.
@@ -485,10 +566,8 @@ func metricStatus(m protocol.Metric) string {
 
 func profDisplay(p protocol.Profile) string {
 	switch p {
-	case protocol.UDPSymmetric:
-		return "UDP-Sym"
-	case protocol.UDPDynamic:
-		return "UDP-Dyn"
+	case protocol.UDP:
+		return "UDP"
 	case protocol.TCP:
 		return "TCP"
 	case protocol.ICMP:
@@ -516,7 +595,7 @@ func (c *Controller) emitFlowTransitions(metrics []protocol.Metric) {
 		if m.PeerID == "" || m.PeerID == m.AgentID {
 			continue
 		}
-		k := m.AgentID + ">" + m.PeerID + "/" + string(m.Profile)
+		k := m.AgentID + ">" + m.PeerID + "/" + string(m.Profile) + "/" + m.FlowID
 		cur := metricStatus(m)
 		prev := c.flowStatus[k]
 		if cur == prev {

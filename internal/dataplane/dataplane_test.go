@@ -59,14 +59,15 @@ func TestResponderUDPEcho(t *testing.T) {
 	r := NewResponder(log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	st := r.Serve(ctx, port)
-	if !st.UDP {
-		t.Fatalf("responder failed to bind UDP: %s", st.Err)
+	st := r.Serve(ctx, []protocol.ListenPort{{Port: port, UDP: true, TCP: true}})
+	if len(st) != 1 || !st[0].UDP {
+		t.Fatalf("responder failed to bind UDP: %+v", st)
 	}
 	time.Sleep(100 * time.Millisecond) // let the listeners settle
 
 	target := net.JoinHostPort("127.0.0.1", itoa(port))
-	m := udpProber{symmetric: false}.Probe(ctx, "self", "peer", target, protocol.TestSpec{PayloadSize: 64})
+	flow := protocol.AgentFlow{ID: "f", Protocol: protocol.UDP, DstAgent: "peer", DstAddr: target, DstPort: port}
+	m := udpProber{}.Probe(ctx, "self", flow, protocol.TestSpec{PayloadSize: 64})
 	if !m.Success {
 		t.Fatalf("expected echo success, got err=%q loss=%.0f", m.Err, m.PacketLoss)
 	}
@@ -88,14 +89,15 @@ func TestResponderTCPEcho(t *testing.T) {
 	r := NewResponder(log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	st := r.Serve(ctx, port)
-	if !st.TCP {
-		t.Fatalf("responder failed to bind TCP: %s", st.Err)
+	st := r.Serve(ctx, []protocol.ListenPort{{Port: port, UDP: true, TCP: true}})
+	if len(st) != 1 || !st[0].TCP {
+		t.Fatalf("responder failed to bind TCP: %+v", st)
 	}
 	time.Sleep(100 * time.Millisecond)
 
 	target := net.JoinHostPort("127.0.0.1", itoa(port))
-	m := tcpProber{}.Probe(ctx, "self", "peer", target, protocol.TestSpec{PayloadSize: 128})
+	flow := protocol.AgentFlow{ID: "f", Protocol: protocol.TCP, DstAgent: "peer", DstAddr: target, DstPort: port}
+	m := tcpProber{}.Probe(ctx, "self", flow, protocol.TestSpec{PayloadSize: 128})
 	if !m.Success || m.RTTMicros <= 0 {
 		t.Fatalf("tcp echo failed: success=%v err=%q", m.Success, m.Err)
 	}

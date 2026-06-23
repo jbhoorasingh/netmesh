@@ -1,19 +1,13 @@
-// Package dataplane runs the Agent's traffic-generation engine. Given a routing
-// table of peers and a test spec, it launches one goroutine per (peer, profile)
-// pair, probes on the configured cadence, and submits Metrics to a sink (the
-// transport client).
+// Package dataplane runs the Agent's traffic-generation engine. Given a set of
+// flows (an Ixia-style traffic plan: srcPort -proto-> dstAddr:dstPort) and a
+// test spec, it launches one goroutine per flow, probes on the configured
+// cadence, and submits Metrics to a sink (the transport client).
 //
-// Four distinct profiles are supported (see protocol.Profile):
-//
-//   - UDP Symmetric: source port is bound equal to the destination port to
-//     exercise strict/symmetric firewall pinholes (e.g. SIP 5060->5060).
-//   - UDP Dynamic:   ephemeral OS-assigned source port.
-//   - TCP:           stateful connect + payload round trip.
-//   - ICMP:          echo request (raw socket / native ping).
-//
-// All four profiles measure real round-trip time and packet loss against the
-// peer-side Responder (UDP/TCP echo); ICMP uses the OS echo-reply path via
-// unprivileged datagram sockets, so it needs no responder.
+// Protocols (see protocol.Profile): UDP and TCP measure a real round trip
+// against the peer-side Responder; ICMP uses the OS echo-reply path via
+// unprivileged datagram sockets, so it needs no responder. A flow's source port
+// may be a specific number (e.g. 5060 -> 5060 for symmetric/SIP) or 0 for an
+// ephemeral source port.
 package dataplane
 
 import (
@@ -37,12 +31,12 @@ type MetricSink interface {
 	SubmitMetric(protocol.Metric)
 }
 
-// Prober executes a single probe against a target and returns a Metric.
+// Prober executes a single probe for a flow and returns a Metric.
 type Prober interface {
-	Probe(ctx context.Context, agentID, peerID, target string, spec protocol.TestSpec) protocol.Metric
+	Probe(ctx context.Context, agentID string, flow protocol.AgentFlow, spec protocol.TestSpec) protocol.Metric
 }
 
-// Engine owns the set of active probe loops for the current routing table.
+// Engine owns the set of active per-flow probe loops.
 type Engine struct {
 	agentID string
 	sink    MetricSink
@@ -54,24 +48,23 @@ type Engine struct {
 	wg     sync.WaitGroup
 }
 
-// NewEngine builds an Engine with the default prober set.
+// NewEngine builds an Engine with the default prober set (one per protocol).
 func NewEngine(agentID string, sink MetricSink, log *logging.Logger) *Engine {
 	return &Engine{
 		agentID: agentID,
 		sink:    sink,
 		log:     log,
 		probers: map[protocol.Profile]Prober{
-			protocol.TCP:          tcpProber{},
-			protocol.UDPDynamic:   udpProber{symmetric: false},
-			protocol.UDPSymmetric: udpProber{symmetric: true},
-			protocol.ICMP:         icmpProber{},
+			protocol.UDP:  udpProber{},
+			protocol.TCP:  tcpProber{},
+			protocol.ICMP: icmpProber{},
 		},
 	}
 }
 
-// Start launches probe loops for every (peer, profile) in the routing table
-// using the given spec. Any previously running test is stopped first.
-func (e *Engine) Start(parent context.Context, table protocol.RoutingTable, spec protocol.TestSpec) {
+// Start launches one probe loop per flow using the given spec. Any previously
+// running test is stopped first.
+func (e *Engine) Start(parent context.Context, flows []protocol.AgentFlow, spec protocol.TestSpec) {
 	e.Stop()
 
 	ctx, cancel := context.WithCancel(parent)
@@ -84,25 +77,20 @@ func (e *Engine) Start(parent context.Context, table protocol.RoutingTable, spec
 		interval = time.Second
 	}
 
-	for _, peer := range table.Peers {
-		if peer.AgentID == e.agentID {
-			continue // don't probe ourselves
+	for _, flow := range flows {
+		prober, ok := e.probers[flow.Protocol]
+		if !ok {
+			e.log.Warnf("dataplane: no prober for protocol", "protocol", flow.Protocol)
+			continue
 		}
-		for _, profile := range peer.Profiles {
-			prober, ok := e.probers[profile]
-			if !ok {
-				e.log.Warnf("dataplane: no prober for profile", "profile", profile)
-				continue
-			}
-			e.wg.Add(1)
-			go e.loop(ctx, prober, peer, profile, spec, interval)
-		}
+		e.wg.Add(1)
+		go e.loop(ctx, prober, flow, spec, interval)
 	}
 	e.log.Emit(logging.Event{
 		Type:    logging.TestStarted,
 		AgentID: e.agentID,
 		Detail:  spec.RunID,
-		Fields:  map[string]any{"peers": len(table.Peers), "intervalMs": spec.IntervalMS},
+		Fields:  map[string]any{"flows": len(flows), "intervalMs": spec.IntervalMS},
 	})
 }
 
@@ -119,15 +107,17 @@ func (e *Engine) Stop() {
 	}
 }
 
-func (e *Engine) loop(ctx context.Context, p Prober, peer protocol.Peer, profile protocol.Profile, spec protocol.TestSpec, interval time.Duration) {
+func (e *Engine) loop(ctx context.Context, p Prober, flow protocol.AgentFlow, spec protocol.TestSpec, interval time.Duration) {
 	defer e.wg.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	sent := 0
 	probe := func() {
-		m := p.Probe(ctx, e.agentID, peer.AgentID, peer.Address, spec)
-		m.Profile = profile
+		m := p.Probe(ctx, e.agentID, flow, spec)
+		m.FlowID = flow.ID
+		m.PeerID = flow.DstAgent
+		m.Profile = flow.Protocol
 		e.sink.SubmitMetric(m)
 		sent++
 	}
@@ -194,6 +184,17 @@ func (br burstResult) apply(m *protocol.Metric, sent int) {
 	}
 }
 
+// addrIP extracts the IP from a net.Addr returned by an ICMP/UDP read.
+func addrIP(a net.Addr) net.IP {
+	switch v := a.(type) {
+	case *net.UDPAddr:
+		return v.IP
+	case *net.IPAddr:
+		return v.IP
+	}
+	return nil
+}
+
 func payloadSize(spec protocol.TestSpec, dflt int) int {
 	if spec.PayloadSize >= headerSize {
 		return spec.PayloadSize
@@ -205,10 +206,14 @@ func payloadSize(spec protocol.TestSpec, dflt int) int {
 // round trip against the peer's echo responder.
 type tcpProber struct{}
 
-func (tcpProber) Probe(ctx context.Context, agentID, peerID, target string, spec protocol.TestSpec) protocol.Metric {
-	m := protocol.Metric{PeerID: peerID, Target: target, TS: time.Now().UnixMilli()}
+func (tcpProber) Probe(ctx context.Context, agentID string, flow protocol.AgentFlow, spec protocol.TestSpec) protocol.Metric {
+	m := protocol.Metric{Target: flow.DstAddr, TS: time.Now().UnixMilli()}
 	d := net.Dialer{Timeout: probeTimeout}
-	conn, err := d.DialContext(ctx, "tcp", target)
+	if flow.SrcPort > 0 {
+		d.LocalAddr = &net.TCPAddr{Port: flow.SrcPort}
+		d.Control = reusePortControl
+	}
+	conn, err := d.DialContext(ctx, "tcp", flow.DstAddr)
 	if err != nil {
 		m.Err = err.Error()
 		m.PacketLoss = 100
@@ -237,60 +242,65 @@ func (tcpProber) Probe(ctx context.Context, agentID, peerID, target string, spec
 	return m
 }
 
-// udpProber sends a burst of UDP datagrams and measures echo RTT / loss. When
-// symmetric is set it binds the local source port equal to the destination port
-// (the distinguishing behaviour for strict/symmetric firewall profiles), using
-// SO_REUSEPORT so it can coexist with the local responder.
-type udpProber struct{ symmetric bool }
+// udpProber sends a burst of UDP datagrams and measures echo RTT / loss. A
+// non-zero source port is bound (with SO_REUSEPORT so it can coexist with the
+// local responder); a zero source port uses an ephemeral one.
+type udpProber struct{}
 
-func (u udpProber) Probe(ctx context.Context, agentID, peerID, target string, spec protocol.TestSpec) protocol.Metric {
-	m := protocol.Metric{PeerID: peerID, Target: target, TS: time.Now().UnixMilli()}
+func (udpProber) Probe(ctx context.Context, agentID string, flow protocol.AgentFlow, spec protocol.TestSpec) protocol.Metric {
+	m := protocol.Metric{Target: flow.DstAddr, TS: time.Now().UnixMilli()}
 
-	raddr, err := net.ResolveUDPAddr("udp4", target)
+	// Dial a CONNECTED socket so the kernel delivers only datagrams from this
+	// flow's destination to it. Without connecting, several flows that share a
+	// source port form one SO_REUSEPORT group on that port (together with the
+	// local responder), and the kernel demuxes inbound datagrams by hashing the
+	// packet tuple — so an echo from one peer can land on a different flow's
+	// socket and be lost/misattributed. A connected 4-tuple sidesteps that.
+	d := net.Dialer{Timeout: probeTimeout}
+	if flow.SrcPort > 0 {
+		d.LocalAddr = &net.UDPAddr{IP: net.IPv4zero, Port: flow.SrcPort}
+		d.Control = reusePortControl
+	}
+	conn, err := d.DialContext(ctx, "udp4", flow.DstAddr)
 	if err != nil {
-		m.Err = "resolve: " + err.Error()
+		m.Err = "dial: " + err.Error()
 		m.PacketLoss = 100
 		return m
 	}
-	m.RemoteAddr = raddr.String()
+	defer conn.Close()
+	m.LocalAddr = conn.LocalAddr().String()
+	m.RemoteAddr = conn.RemoteAddr().String()
 
-	lc := net.ListenConfig{}
-	laddr := "0.0.0.0:0"
-	if u.symmetric {
-		// Bind the local source port equal to the destination port (the
-		// distinguishing behaviour of the symmetric profile), with SO_REUSEPORT
-		// so it can coexist with the local responder.
-		laddr = "0.0.0.0:" + itoa(raddr.Port)
-		lc.Control = reusePortControl
+	// Read the received hop limit (TTL) via an IPv4 packet conn over the same fd.
+	var p4 *ipv4.PacketConn
+	if pc, ok := conn.(net.PacketConn); ok {
+		p4 = ipv4.NewPacketConn(pc)
+		_ = p4.SetControlMessage(ipv4.FlagTTL, true)
 	}
-	pc, err := lc.ListenPacket(ctx, "udp4", laddr)
-	if err != nil {
-		m.Err = "listen: " + err.Error()
-		m.PacketLoss = 100
-		return m
-	}
-	defer pc.Close()
-	m.LocalAddr = pc.LocalAddr().String()
-
-	// Wrap in an IPv4 packet conn to read the received hop limit (TTL).
-	p4 := ipv4.NewPacketConn(pc)
-	_ = p4.SetControlMessage(ipv4.FlagTTL, true)
 
 	size := payloadSize(spec, 64)
 	for seq := 0; seq < probeBurst; seq++ {
-		if _, err := p4.WriteTo(encodeProbe(uint64(seq), size), nil, raddr); err != nil {
+		if _, err := conn.Write(encodeProbe(uint64(seq), size)); err != nil {
 			m.Err = "write: " + err.Error()
 			m.PacketLoss = 100
 			return m
 		}
 	}
 
-	_ = p4.SetReadDeadline(time.Now().Add(probeTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(probeTimeout))
 	seen := make(map[uint64]bool)
 	var br burstResult
 	buf := make([]byte, size+64)
 	for br.received < probeBurst {
-		n, cm, _, err := p4.ReadFrom(buf)
+		var (
+			n  int
+			cm *ipv4.ControlMessage
+		)
+		if p4 != nil {
+			n, cm, _, err = p4.ReadFrom(buf)
+		} else {
+			n, err = conn.Read(buf)
+		}
 		if err != nil {
 			break
 		}
@@ -314,10 +324,10 @@ func (u udpProber) Probe(ctx context.Context, agentID, peerID, target string, sp
 // ping_group_range. The OS answers echo requests, so no responder is needed.
 type icmpProber struct{}
 
-func (icmpProber) Probe(ctx context.Context, agentID, peerID, target string, spec protocol.TestSpec) protocol.Metric {
-	m := protocol.Metric{PeerID: peerID, Target: target, TS: time.Now().UnixMilli()}
-	host := target
-	if h, _, err := net.SplitHostPort(target); err == nil {
+func (icmpProber) Probe(ctx context.Context, agentID string, flow protocol.AgentFlow, spec protocol.TestSpec) protocol.Metric {
+	m := protocol.Metric{Target: flow.DstAddr, TS: time.Now().UnixMilli()}
+	host := flow.DstAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
 	m.Target = host
@@ -364,9 +374,14 @@ func (icmpProber) Probe(ctx context.Context, agentID, peerID, target string, spe
 	var br burstResult
 	rb := make([]byte, 1500)
 	for br.received < probeBurst {
-		n, cm, _, err := p4.ReadFrom(rb)
+		n, cm, src, err := p4.ReadFrom(rb)
 		if err != nil {
 			break
+		}
+		// Only count replies from this flow's destination. The kernel demuxes
+		// echo replies per socket, but a source check is cheap defence in depth.
+		if ip := addrIP(src); ip != nil && !ip.Equal(ipAddr.IP) {
+			continue
 		}
 		rm, err := icmp.ParseMessage(1, rb[:n]) // 1 = IANA protocol number for ICMPv4
 		if err != nil || rm.Type != ipv4.ICMPTypeEchoReply {

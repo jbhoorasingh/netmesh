@@ -43,12 +43,9 @@ type Agent struct {
 	store     *uistream.Store
 	ui        *uistream.Hub
 
-	mu      sync.RWMutex
-	routing protocol.RoutingTable
-	ctx     context.Context // base context for engine/diag work
-
-	respMu     sync.Mutex
-	respCancel context.CancelFunc // cancels the current responder binding
+	mu    sync.RWMutex
+	flows []protocol.AgentFlow
+	ctx   context.Context // base context for engine/diag work
 }
 
 // New constructs an Agent.
@@ -97,9 +94,8 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	go a.client.Run(ctx)
 	go a.pumpEventsToUI(ctx)
-	// Bind the responder on the default data port as a baseline; a test may
-	// rebind it to a master-chosen port.
-	a.bindResponder(ctx, a.cfg.DataPort)
+	// No data port is bound at startup: the master assigns listen ports via a
+	// FLOW_PLAN when a test is set up.
 
 	srv := &http.Server{
 		Addr:              a.cfg.ListenAddr(),
@@ -140,17 +136,22 @@ func (a *Agent) routes() http.Handler {
 // Long-running work (diagnostics) is dispatched to its own goroutine.
 func (a *Agent) onControl(env protocol.Envelope, out transport.Sender) {
 	switch env.Type {
-	case protocol.TypeRouting:
-		var table protocol.RoutingTable
-		if err := env.DecodePayload(&table); err != nil {
-			a.log.Warnf("agent: bad routing table", "err", err)
+	case protocol.TypeFlowPlan:
+		var plan protocol.FlowPlan
+		if err := env.DecodePayload(&plan); err != nil {
+			a.log.Warnf("agent: bad flow plan", "err", err)
 			return
 		}
 		a.mu.Lock()
-		a.routing = table
+		a.flows = plan.Flows
 		a.mu.Unlock()
+		// Bind the listen ports the master assigned and report availability.
+		status := a.bindResponder(a.baseCtx(), plan.ListenPorts)
+		if err := out.Send(protocol.TypePortStatus, protocol.PortReport{AgentID: a.cfg.AgentID, Ports: status}); err != nil {
+			a.log.Warnf("agent: port report send failed", "err", err)
+		}
 		a.log.Emit(logging.Event{Type: logging.RoutingUpdated, AgentID: a.cfg.AgentID,
-			Fields: map[string]any{"peers": len(table.Peers), "epoch": table.Epoch}})
+			Fields: map[string]any{"flows": len(plan.Flows), "listenPorts": len(plan.ListenPorts), "epoch": plan.Epoch}})
 
 	case protocol.TypeTestStart:
 		var spec protocol.TestSpec
@@ -158,21 +159,11 @@ func (a *Agent) onControl(env protocol.Envelope, out transport.Sender) {
 			a.log.Warnf("agent: bad test spec", "err", err)
 			return
 		}
-		// Bind the responder on the master-chosen port and report availability.
-		port := spec.Port
-		if port <= 0 {
-			port = a.cfg.DataPort
-		}
-		status := a.bindResponder(a.baseCtx(), port)
-		status.AgentID = a.cfg.AgentID
-		if err := out.Send(protocol.TypePortStatus, status); err != nil {
-			a.log.Warnf("agent: port status send failed", "err", err)
-		}
-		a.engine.Start(a.baseCtx(), a.currentRouting(), spec)
+		a.engine.Start(a.baseCtx(), a.currentFlows(), spec)
 
 	case protocol.TypeTestStop:
 		a.engine.Stop()
-		a.bindResponder(a.baseCtx(), a.cfg.DataPort) // return to the baseline port
+		a.bindResponder(a.baseCtx(), nil) // release listen ports
 
 	case protocol.TypeDiagRequest:
 		var req protocol.DiagRequest
@@ -210,24 +201,19 @@ func (a *Agent) baseCtx() context.Context {
 	return a.ctx
 }
 
-func (a *Agent) currentRouting() protocol.RoutingTable {
+func (a *Agent) currentFlows() []protocol.AgentFlow {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.routing
+	return a.flows
 }
 
-// bindResponder (re)binds the data-plane echo responder to port, cancelling any
-// previous binding, and returns the resulting port-availability status. Serving
-// continues in the background until the next rebind or until parent is done.
-func (a *Agent) bindResponder(parent context.Context, port int) protocol.PortStatus {
-	a.respMu.Lock()
-	if a.respCancel != nil {
-		a.respCancel()
-	}
-	ctx, cancel := context.WithCancel(parent)
-	a.respCancel = cancel
-	a.respMu.Unlock()
-	return a.responder.Serve(ctx, port)
+// bindResponder (re)binds the data-plane echo responder to the given listen
+// ports and returns the resulting per-port availability status. The Responder
+// tears down any previous binding synchronously before binding the new set;
+// serving continues in the background until the next rebind or until parent is
+// done.
+func (a *Agent) bindResponder(parent context.Context, ports []protocol.ListenPort) []protocol.PortStatus {
+	return a.responder.Serve(parent, ports)
 }
 
 func (a *Agent) pumpEventsToUI(ctx context.Context) {
@@ -253,7 +239,7 @@ func (a *Agent) handleInfo(w http.ResponseWriter, r *http.Request) {
 	st := a.client.Status()
 	host, _ := os.Hostname()
 	a.mu.RLock()
-	peers := len(a.routing.Peers)
+	flows := len(a.flows)
 	a.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"role":         "agent",
@@ -261,7 +247,6 @@ func (a *Agent) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"host":         host,
 		"hostAddr":     localIP(),
 		"port":         a.cfg.Port,
-		"dataPort":     a.cfg.DataPort,
 		"mode":         a.cfg.Mode.String(),
 		"master":       st.Master,
 		"joined":       st.Master != "",
@@ -270,7 +255,7 @@ func (a *Agent) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"framesRx":     st.FramesRx,
 		"framesTx":     st.FramesTx,
 		"spoolLen":     st.SpoolLen,
-		"peers":        peers,
+		"flows":        flows,
 		"diagCommands": diag.Allowed(),
 	})
 }

@@ -3,17 +3,14 @@ package controller
 import (
 	"path/filepath"
 	"testing"
-
-	"netmesh/internal/protocol"
 )
 
 func ptr[T any](v T) *T { return &v }
 
 func TestAdminDefaults(t *testing.T) {
 	s := newAdminStore("")
-	c := s.get("unknown")
-	if !c.Enabled || len(c.Profiles) != len(protocol.AllProfiles) {
-		t.Errorf("default = %+v, want enabled + all profiles", c)
+	if c := s.get("unknown"); !c.Enabled {
+		t.Errorf("default = %+v, want enabled", c)
 	}
 }
 
@@ -27,11 +24,6 @@ func TestAdminPartialUpdate(t *testing.T) {
 	s.update(AgentUpdate{AgentID: "a", Enabled: ptr(false)})
 	if got := s.get("a"); got.Label != "New York" || got.Enabled {
 		t.Errorf("after disable: %+v", got)
-	}
-	// Profile update drops invalid entries.
-	s.update(AgentUpdate{AgentID: "a", Profiles: ptr([]protocol.Profile{protocol.TCP, "bogus", protocol.ICMP})})
-	if got := s.get("a"); len(got.Profiles) != 2 {
-		t.Errorf("profiles = %v, want [tcp icmp]", got.Profiles)
 	}
 }
 

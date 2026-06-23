@@ -6,12 +6,15 @@ import (
 )
 
 func TestEnvelopeRoundTrip(t *testing.T) {
-	in := RoutingTable{Epoch: 7, Peers: []Peer{{AgentID: "b", Address: "10.0.0.2:5999", Profiles: []Profile{TCP, UDPSymmetric}}}}
-	env, err := NewEnvelope(TypeRouting, "ctrl", 42, 1700000000000, in)
+	in := FlowPlan{Epoch: 7,
+		ListenPorts: []ListenPort{{Port: 4400, UDP: true}},
+		Flows:       []AgentFlow{{ID: "f1", SrcPort: 4400, Protocol: UDP, DstAgent: "b", DstAddr: "10.0.0.2:4400", DstPort: 4400}},
+	}
+	env, err := NewEnvelope(TypeFlowPlan, "ctrl", 42, 1700000000000, in)
 	if err != nil {
 		t.Fatalf("NewEnvelope: %v", err)
 	}
-	if env.Seq != 42 || env.Type != TypeRouting {
+	if env.Seq != 42 || env.Type != TypeFlowPlan {
 		t.Errorf("envelope header wrong: %+v", env)
 	}
 
@@ -23,11 +26,11 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	var out RoutingTable
+	var out FlowPlan
 	if err := got.DecodePayload(&out); err != nil {
 		t.Fatalf("DecodePayload: %v", err)
 	}
-	if out.Epoch != 7 || len(out.Peers) != 1 || out.Peers[0].AgentID != "b" {
+	if out.Epoch != 7 || len(out.Flows) != 1 || out.Flows[0].DstAgent != "b" || out.Flows[0].Protocol != UDP {
 		t.Errorf("roundtrip mismatch: %+v", out)
 	}
 }

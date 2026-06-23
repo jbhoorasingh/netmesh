@@ -73,7 +73,7 @@ distinct data port — see [Data plane](#data-plane).
 | `-port=<port>`    | UI/API/WebSocket port on both roles. Default **5999**.         |
 | `-id=<name>`      | Override the advertised agent ID (defaults to hostname).       |
 | `-token=<secret>` | Optional shared secret for the agent control plane: required of joining agents on the Controller, presented when joining on an Agent. Empty = open control plane. |
-| `-data-port=<port>` | Agent data-plane UDP/TCP echo port for peer probes. Default `-port + 1`. Give each agent a distinct value when running several on one host. |
+| `-data-port=<port>` | _Legacy / optional._ Agents no longer bind a data port at startup — the master assigns listen ports per flow. Kept for back-compat; unused for binding. |
 
 ## Architecture
 
@@ -147,54 +147,60 @@ The single user-supplied value (a target host) is validated against a strict
 hostname/IP pattern and may not begin with `-` (argument-injection guard).
 Output is streamed back over the control plane in bounded chunks.
 
-## Data plane
+## Data plane — traffic flows
 
-On `TEST_START`, each agent runs one goroutine per (peer, profile) and probes on
-the configured cadence, submitting sequence-numbered metrics. Every agent also
-runs a **Responder** — UDP and TCP echo servers on its data-plane port
-(advertised at registration) — so probes complete a real round trip:
+NetMesh uses an **Ixia-style per-flow** traffic model. A **flow** is:
 
-| Profile | How it measures | Notes |
-|---------|-----------------|-------|
-| **TCP** | connect + payload echo round trip | RTT incl. connect |
-| **UDP dynamic** | burst of datagrams from an ephemeral source port → echo | loss = lost/burst |
-| **UDP symmetric** | same, but the source port is bound **equal to the destination port** (`SO_REUSEPORT`) | tests strict/symmetric firewall pinholes; see caveat |
-| **ICMP** | echo requests via an unprivileged datagram socket (`udp4`) | OS answers; no responder needed |
+```
+srcAgent:srcPort  --proto-->  dstAgent:dstPort
+```
+
+where `proto` is `udp`, `tcp`, or `icmp`; `srcPort` is a specific number or `0`
+for a dynamic (ephemeral) source port; ICMP is port-less. Setting `srcPort ==
+dstPort` gives the classic symmetric (e.g. SIP 5060→5060) test. You define flows
+in the **Traffic Flows** editor (or via the API), then press START TEST.
+
+**Ports are assigned by the master, not at startup.** Agents come online with no
+data port. On START the controller resolves the flows into a per-agent
+**`FLOW_PLAN`**: the ports each agent must listen on (because it is a flow's
+destination) and the flows it originates (with destinations resolved to
+addresses). Each agent then binds those listen ports **on demand** and runs one
+prober per flow:
+
+| proto | How it measures |
+|-------|-----------------|
+| **TCP** | connect (binding `srcPort` if set) + payload echo round trip |
+| **UDP** | burst of datagrams from `srcPort` (or ephemeral) → echo; loss = lost/burst |
+| **ICMP** | echo requests via an unprivileged datagram socket (`udp4`); OS answers, no responder needed |
 
 Each probe sends a small burst (4 packets) and reports average RTT and loss %.
+Every agent runs a **Responder** (UDP/TCP echo) on exactly the listen ports its
+plan assigns — bound with `SO_REUSEPORT` so a symmetric prober can share a port.
 
-**Master-driven test setup.** From the Controller you choose the **data-plane
-port** and which **protocols** to run (the *Set up data-plane test* dialog behind
-START TEST, or `POST /api/tests/start {"port":9100,"protocols":["tcp","icmp"],"intervalMs":400}`).
-A non-zero port is applied mesh-wide — agents bind that port for their responder
-and probe each other on it; `0` falls back to each agent's own data port. The
-selection is intersected with each agent's admin-configured profiles.
-
-**Port-availability feedback.** When a test starts, each agent tries to bind the
-chosen port and reports a `PORT_STATUS` back to the master (UDP/TCP bound or not),
-surfaced as `PORT_BOUND` / `PORT_UNAVAILABLE` events, on `/api/agents`
-(`testPort`/`portUdp`/`portTcp`), and in the node-detail drawer.
+**Port-availability feedback.** When the plan arrives, each agent tries to bind
+its listen ports and reports a `PORT_STATUS` back to the master, surfaced as
+`PORT_BOUND` / `PORT_UNAVAILABLE` events, on `/api/agents` (`ports`), and in the
+admin table / node-detail drawer.
 
 **IP header.** Each metric carries the observed source/destination address and
 the received **TTL** (hop limit), read via IPv4 control messages for ICMP and
 UDP. The probe-detail drawer shows an *IP HEADER / SOCKET* line, e.g.
-`ttl 64 · src 0.0.0.0:9100 → dst 10.0.0.2:9100` — which also makes the symmetric
-`src port == dst port` visible. (Go's socket API doesn't expose received TTL for
-TCP, so TCP shows addresses only.)
+`ttl 64 · src 0.0.0.0:4400 → dst 10.0.0.2:4400` — which makes `src port == dst
+port` visible. (Go's socket API doesn't expose received TTL for TCP, so TCP shows
+addresses only.)
 
-> **UDP-symmetric single-host caveat:** "source port == destination port" makes
-> the source and destination endpoints identical when every agent shares one
-> loopback IP (`127.0.0.1`), which is degenerate. The binding is correct for the
-> real case (one agent per host / distinct IPs); on a single dev host symmetric
-> shows partial success while the other three profiles are fully healthy.
+> **UDP-symmetric single-host caveat:** `src port == dst port` makes the source
+> and destination endpoints identical when both agents share one loopback IP
+> (`127.0.0.1`). It is correct for distinct hosts; choosing distinct dst ports
+> per flow avoids the degeneracy on a single dev host.
 
-To exercise the mesh on one machine, give each agent a distinct data port:
+Run a two-agent setup locally (no data port needed — the master assigns ports):
 
 ```bash
-./netmesh -master=self -port=5999                                  # controller
-./netmesh -master=127.0.0.1:5999 -port=6001 -data-port=7001 -id=a  # agents
-./netmesh -master=127.0.0.1:5999 -port=6002 -data-port=7002 -id=b
-# open http://127.0.0.1:5999 and press START TEST
+./netmesh -master=self -port=5999                          # controller
+./netmesh -master=127.0.0.1:5999 -port=6001 -id=agent1     # agents
+./netmesh -master=127.0.0.1:5999 -port=6002 -id=agent2
+# open http://127.0.0.1:5999 → Traffic Flows → add flows → START TEST
 ```
 
 ## Web UI
@@ -210,14 +216,18 @@ role toggle.
   live event log (maximizable, filter by level + text, pause/resume the tail with
   a "N new — jump to latest" catch-up), a Sequence Monitor with per-flow
   packet-sequence strips, node/test drill-down drawers, the Remote Diagnostics
-  terminal, and an **Admin** page for agent management.
+  terminal, a **Traffic Flows** editor, and an **Admin** page for agent
+  management.
 - **Agent:** node identity, master + WebSocket link health, local KPIs, local
   latency chart, local flows, and the holding-state "Join a Master" modal.
 
-The dashboard is live, not simulated: control-plane RTT comes from the
-application-layer heartbeat, and node-to-node flows come from the data-plane
-engine (TCP connect probes succeed today; UDP/ICMP show as pending/loss until
-the responder lands).
+The **Traffic Flows** tab is the Ixia-style editor: each row is
+`srcAgent:srcPort —proto→ dstAgent:dstPort` (agent dropdowns, src/dst ports,
+protocol, enable toggle), with a new-flow form and a one-click **Generate mesh**
+helper (full mesh across connected agents on a chosen port/protocols, optionally
+symmetric). The dashboard is live, not simulated: control-plane RTT comes from
+the application-layer heartbeat, and node-to-node flows come from the data-plane
+engine running the defined flows.
 
 ### HTTP / WS surface
 
@@ -226,14 +236,18 @@ the responder lands).
 | `GET /` , `/app.js`      | open       | embedded UI assets |
 | `GET /api/info`          | open       | role, host, port, auth state, diag commands |
 | `GET /api/auth`          | open       | auth state; returns a `wsToken` to authenticated callers |
-| `GET /api/agents`        | open       | connected agents + per-agent WS RTT / frames |
-| `GET /api/metrics`       | open       | latest metric per (agent, peer, profile) |
+| `GET /api/agents`        | open       | connected agents + WS RTT / frames / listen ports |
+| `GET /api/metrics`       | open       | latest metric per flow |
+| `GET /api/flows`         | open       | the defined traffic flows |
 | `GET /ws/ui`             | open\*     | live event / telemetry / diag stream |
-| `POST /api/tests/start`  | privileged | start a test (auto-builds a full mesh if no body) |
+| `POST /api/tests/start`  | privileged | run the defined flows (`{intervalMs}`) |
 | `POST /api/tests/stop`   | privileged | stop the active test |
-| `POST /api/routing`      | privileged | push an explicit routing table |
+| `POST /api/flows/upsert` | privileged | add or update a flow |
+| `POST /api/flows/delete` | privileged | delete a flow by id |
+| `POST /api/flows/mesh`   | privileged | append a full mesh (`{port,protocols,symmetric}`) |
+| `POST /api/flows/clear`  | privileged | delete all flows |
 | `POST /api/diag`         | privileged | run a whitelisted diagnostic on an agent |
-| `POST /api/admin/agents` | privileged | update an agent's label/group/enabled/profiles |
+| `POST /api/admin/agents` | privileged | update an agent's label/group/enabled |
 | `POST /api/admin/agents/evict` | privileged | force-drop an agent's control link |
 | `GET /ws/agent`          | token\*\*  | agent control plane |
 | `POST /api/join` (agent) | loopback   | set the Master IP at runtime |
@@ -250,14 +264,14 @@ manages the fleet:
 - **Friendly name** — a label shown on the topology and node detail instead of
   the raw agent ID.
 - **Group** — a free-form tag (region, role).
-- **Enable / disable** — disabled agents are excluded from the mesh (neither
-  probe nor are probed) and told to stop.
-- **Per-agent traffic profiles** — choose which of UDP-Sym / UDP-Dyn / TCP / ICMP
-  each agent generates; `START TEST` builds each agent its own routing table
-  accordingly, and edits **re-apply live** to a running test.
+- **Enable / disable** — disabled agents are excluded from all flows (as source
+  or destination) and told to stop; edits **re-apply live** to a running test.
+- **Listen ports** — the data-plane ports the agent currently has bound (with
+  UDP/TCP availability), reported back from the active flow plan.
 - **Evict** — force-drop an agent's control link.
 
-Config is persisted best-effort to `netmesh-admin.json` (controller working
+Config is persisted best-effort to `netmesh-admin.json`, and the traffic flows to
+`netmesh-flows.json` (controller working
 directory) so names and test config survive a restart. The data plane honours it
 end-to-end: e.g. an agent set to TCP+ICMP only generates exactly those flows, and
 a disabled agent disappears from the mesh entirely.
@@ -389,13 +403,14 @@ volume mounted at `~/.claude`. Shared project permissions (allowing `go build` /
 | RBAC (open / secured) | ✅ implemented |
 | Diagnostics whitelist + streaming | ✅ implemented |
 | Structured JSON event logging + UI fan-out | ✅ implemented |
-| Data plane: TCP payload round-trip probe | ✅ implemented |
-| Data plane: UDP dynamic (echo RTT + loss) | ✅ implemented |
-| Data plane: UDP symmetric (src-port binding + echo) | ✅ implemented; ⚠️ degenerate on single loopback host |
-| Data plane: ICMP (unprivileged datagram echo) | ✅ implemented |
-| Data-plane **Responder** (peer UDP/TCP echo) | ✅ implemented |
+| Ixia-style per-flow traffic model (UDP/TCP/ICMP, src/dst ports) | ✅ implemented |
+| Master-assigned, on-demand listen ports (no startup data port) | ✅ implemented |
+| Data plane: UDP/TCP echo (RTT + loss) + ICMP (unprivileged datagram echo) | ✅ implemented |
+| IP-header capture (TTL + src/dst) + port-availability feedback | ✅ implemented |
+| Data-plane **Responder** (multi-port UDP/TCP echo, bound on demand) | ✅ implemented |
 | Production UI (topology / grid / graphs / console / sequence monitor) | ✅ implemented from `NetMesh.dc.html`, wired to live data |
-| Admin page (rename / group / enable-disable / per-agent profiles / evict) | ✅ implemented, persisted, honored by the test engine |
+| Traffic Flows editor (Ixia-style) + mesh generator | ✅ implemented, persisted |
+| Admin page (rename / group / enable-disable / evict) | ✅ implemented, persisted |
 | Optional control-plane join token (`-token`) | ✅ implemented |
 
 ## Design provenance

@@ -26,7 +26,7 @@ const (
 
 	// Control plane: controller -> agent.
 	TypeRegisterAck MessageType = "REGISTER_ACK"
-	TypeRouting     MessageType = "ROUTING_TABLE" // peer list + per-peer test plan
+	TypeFlowPlan    MessageType = "FLOW_PLAN" // listen ports + flows this agent generates
 	TypeTestStart   MessageType = "TEST_START"
 	TypeTestStop    MessageType = "TEST_STOP"
 	TypeDiagRequest MessageType = "DIAG_REQUEST"
@@ -93,37 +93,54 @@ type RegisterAck struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
-// Peer describes a single target an agent should probe.
-type Peer struct {
-	AgentID  string    `json:"agentId"`
-	Address  string    `json:"address"` // dialable host or IP
-	Profiles []Profile `json:"profiles"`
+// ListenPort is a data-plane port an agent's responder must bind (it is the
+// destination of one or more flows). The master computes these per agent.
+type ListenPort struct {
+	Port int  `json:"port"`
+	UDP  bool `json:"udp"`
+	TCP  bool `json:"tcp"`
 }
 
-// RoutingTable is the controller's instruction to an agent describing which
-// peers to probe and with which traffic profiles.
-type RoutingTable struct {
-	Epoch uint64 `json:"epoch"` // increments each time the controller revises the plan
-	Peers []Peer `json:"peers"`
+// AgentFlow is a single traffic flow an agent originates, with the destination
+// already resolved to an address by the master.
+type AgentFlow struct {
+	ID       string  `json:"id"`
+	SrcPort  int     `json:"srcPort"` // 0 = dynamic / ephemeral source port
+	Protocol Profile `json:"protocol"`
+	DstAgent string  `json:"dstAgent"`
+	DstAddr  string  `json:"dstAddr"` // resolved ip:port (ip only for icmp)
+	DstPort  int     `json:"dstPort"`
 }
 
-// TestSpec parameterises an active test run.
+// FlowPlan is the controller's per-agent instruction: which ports to bind for
+// the responder, and which flows to generate.
+type FlowPlan struct {
+	Epoch       uint64       `json:"epoch"`
+	ListenPorts []ListenPort `json:"listenPorts"`
+	Flows       []AgentFlow  `json:"flows"`
+}
+
+// TestSpec parameterises an active test run (cadence/payload).
 type TestSpec struct {
 	RunID       string `json:"runId"`
-	IntervalMS  int64  `json:"intervalMs"`  // probe cadence per profile
+	IntervalMS  int64  `json:"intervalMs"`  // probe cadence per flow
 	PayloadSize int    `json:"payloadSize"` // bytes
 	Count       int    `json:"count"`       // 0 == run until TestStop
-	Port        int    `json:"port"`        // data-plane port to bind/probe (0 == agent default)
 }
 
-// PortStatus is an agent's report of whether it could bind the test port for
-// the data-plane responder — the master's port-availability validation.
+// PortStatus reports whether one data-plane port bound on an agent.
 type PortStatus struct {
-	AgentID string `json:"agentId"`
-	Port    int    `json:"port"`
-	UDP     bool   `json:"udp"` // UDP bind succeeded
-	TCP     bool   `json:"tcp"` // TCP bind succeeded
-	Err     string `json:"err,omitempty"`
+	Port int    `json:"port"`
+	UDP  bool   `json:"udp"`
+	TCP  bool   `json:"tcp"`
+	Err  string `json:"err,omitempty"`
+}
+
+// PortReport is an agent's batch report of its responder port bindings — the
+// master's port-availability validation.
+type PortReport struct {
+	AgentID string       `json:"agentId"`
+	Ports   []PortStatus `json:"ports"`
 }
 
 // DiagRequest is a Controller-initiated diagnostic command. Only whitelisted

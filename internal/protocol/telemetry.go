@@ -1,46 +1,48 @@
 package protocol
 
-// Profile enumerates the distinct traffic profiles the data-plane engine can
-// generate. The string values are stable wire identifiers — do not rename.
+// Profile is the L4 protocol a flow uses. (The source/destination ports are
+// carried by the flow itself; "symmetric" is simply a UDP flow whose source
+// port equals its destination port.) The string values are stable wire
+// identifiers — do not rename.
 type Profile string
 
 const (
-	// UDPSymmetric binds the local source port equal to the destination port
-	// (e.g. 5060 -> 5060) to exercise strict/symmetric firewall rules such as
-	// SIP/RTP pinholes.
-	UDPSymmetric Profile = "udp_symmetric"
-	// UDPDynamic uses an ephemeral OS-assigned source port.
-	UDPDynamic Profile = "udp_dynamic"
+	// UDP performs a UDP datagram echo round trip.
+	UDP Profile = "udp"
 	// TCP performs a stateful connect + payload round trip.
 	TCP Profile = "tcp"
-	// ICMP performs an echo request (native ping / raw socket).
+	// ICMP performs an echo request (port-less).
 	ICMP Profile = "icmp"
 )
 
-// AllProfiles is the canonical ordering used by the UI grid.
-var AllProfiles = []Profile{UDPSymmetric, UDPDynamic, TCP, ICMP}
+// AllProfiles is the canonical protocol ordering used by the UI.
+var AllProfiles = []Profile{UDP, TCP, ICMP}
 
-// Valid reports whether p is a recognised profile.
+// Valid reports whether p is a recognised protocol.
 func (p Profile) Valid() bool {
 	switch p {
-	case UDPSymmetric, UDPDynamic, TCP, ICMP:
+	case UDP, TCP, ICMP:
 		return true
 	default:
 		return false
 	}
 }
 
+// HasPorts reports whether the protocol uses ports (UDP/TCP do, ICMP does not).
+func (p Profile) HasPorts() bool { return p == UDP || p == TCP }
+
 // Metric is a single probe result. Metrics are produced by the data-plane
 // engine, carry a per-agent monotonic Seq, and are batched into TELEMETRY
 // envelopes. The controller tracks Seq continuity per agent to surface
 // PACKET_SEQUENCE_MISSED events.
 type Metric struct {
-	Seq     uint64  `json:"seq"`     // per-agent telemetry sequence (gap == loss)
-	AgentID string  `json:"agentId"` // origin agent
-	PeerID  string  `json:"peerId"`  // target agent
-	Profile Profile `json:"profile"`
-	Target  string  `json:"target"` // resolved host:port actually probed
-	TS      int64   `json:"ts"`     // unix milliseconds when the probe completed
+	Seq     uint64  `json:"seq"`              // per-agent telemetry sequence (gap == loss)
+	AgentID string  `json:"agentId"`          // origin agent
+	PeerID  string  `json:"peerId"`           // target agent
+	FlowID  string  `json:"flowId,omitempty"` // the traffic flow this probe belongs to
+	Profile Profile `json:"profile"`          // L4 protocol (udp/tcp/icmp)
+	Target  string  `json:"target"`           // resolved host:port actually probed
+	TS      int64   `json:"ts"`               // unix milliseconds when the probe completed
 
 	Success    bool    `json:"success"`
 	RTTMicros  int64   `json:"rttUs"`   // round-trip time in microseconds (0 on failure)

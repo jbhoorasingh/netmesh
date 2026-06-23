@@ -71,8 +71,10 @@ func (h *Hub) Broadcast(msg Message, onlyPrivileged bool) {
 	}
 }
 
-// Store keeps the latest metric for each (agent, peer, profile) tuple so the UI
-// grid can render current mesh state without replaying history.
+// Store keeps the latest metric for each flow so the UI grid can render current
+// mesh state without replaying history. The key includes FlowID so two flows
+// between the same (agent, peer, profile) — e.g. UDP to different dst ports —
+// occupy distinct grid rows instead of collapsing into one.
 type Store struct {
 	mu     sync.RWMutex
 	latest map[string]protocol.Metric
@@ -82,7 +84,7 @@ type Store struct {
 func NewStore() *Store { return &Store{latest: make(map[string]protocol.Metric)} }
 
 func key(m protocol.Metric) string {
-	return m.AgentID + "|" + m.PeerID + "|" + string(m.Profile)
+	return m.AgentID + "|" + m.PeerID + "|" + string(m.Profile) + "|" + m.FlowID
 }
 
 // Ingest records each metric as the latest for its tuple (newest Seq wins; a
