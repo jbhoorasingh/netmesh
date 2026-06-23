@@ -215,6 +215,8 @@ func (tcpProber) Probe(ctx context.Context, agentID, peerID, target string, spec
 		return m
 	}
 	defer conn.Close()
+	m.LocalAddr = conn.LocalAddr().String()
+	m.RemoteAddr = conn.RemoteAddr().String()
 
 	pkt := encodeProbe(0, payloadSize(spec, 64))
 	_ = conn.SetDeadline(time.Now().Add(probeTimeout))
@@ -244,47 +246,51 @@ type udpProber struct{ symmetric bool }
 func (u udpProber) Probe(ctx context.Context, agentID, peerID, target string, spec protocol.TestSpec) protocol.Metric {
 	m := protocol.Metric{PeerID: peerID, Target: target, TS: time.Now().UnixMilli()}
 
-	raddr, err := net.ResolveUDPAddr("udp", target)
+	raddr, err := net.ResolveUDPAddr("udp4", target)
 	if err != nil {
 		m.Err = "resolve: " + err.Error()
 		m.PacketLoss = 100
 		return m
 	}
+	m.RemoteAddr = raddr.String()
 
-	dialer := net.Dialer{Timeout: probeTimeout}
+	lc := net.ListenConfig{}
+	laddr := "0.0.0.0:0"
 	if u.symmetric {
-		dialer.LocalAddr = &net.UDPAddr{IP: net.IPv4zero, Port: raddr.Port}
-		dialer.Control = reusePortControl
+		// Bind the local source port equal to the destination port (the
+		// distinguishing behaviour of the symmetric profile), with SO_REUSEPORT
+		// so it can coexist with the local responder.
+		laddr = "0.0.0.0:" + itoa(raddr.Port)
+		lc.Control = reusePortControl
 	}
-	conn, err := dialer.DialContext(ctx, "udp", target)
+	pc, err := lc.ListenPacket(ctx, "udp4", laddr)
 	if err != nil {
-		m.Err = "dial: " + err.Error()
+		m.Err = "listen: " + err.Error()
 		m.PacketLoss = 100
 		return m
 	}
-	defer conn.Close()
-	if u.symmetric {
-		if local, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-			m.Target = target + " (src :" + itoa(local.Port) + ")"
-		}
-	}
+	defer pc.Close()
+	m.LocalAddr = pc.LocalAddr().String()
+
+	// Wrap in an IPv4 packet conn to read the received hop limit (TTL).
+	p4 := ipv4.NewPacketConn(pc)
+	_ = p4.SetControlMessage(ipv4.FlagTTL, true)
 
 	size := payloadSize(spec, 64)
 	for seq := 0; seq < probeBurst; seq++ {
-		if _, err := conn.Write(encodeProbe(uint64(seq), size)); err != nil {
+		if _, err := p4.WriteTo(encodeProbe(uint64(seq), size), nil, raddr); err != nil {
 			m.Err = "write: " + err.Error()
 			m.PacketLoss = 100
 			return m
 		}
 	}
 
-	deadline := time.Now().Add(probeTimeout)
-	_ = conn.SetReadDeadline(deadline)
+	_ = p4.SetReadDeadline(time.Now().Add(probeTimeout))
 	seen := make(map[uint64]bool)
 	var br burstResult
 	buf := make([]byte, size+64)
 	for br.received < probeBurst {
-		n, err := conn.Read(buf)
+		n, cm, _, err := p4.ReadFrom(buf)
 		if err != nil {
 			break
 		}
@@ -295,6 +301,9 @@ func (u udpProber) Probe(ctx context.Context, agentID, peerID, target string, sp
 		seen[seq] = true
 		br.received++
 		br.rttSumNs += time.Now().UnixNano() - sendNs
+		if cm != nil && m.TTL == 0 {
+			m.TTL = cm.TTL
+		}
 	}
 	br.apply(&m, probeBurst)
 	return m
@@ -319,6 +328,7 @@ func (icmpProber) Probe(ctx context.Context, agentID, peerID, target string, spe
 		m.PacketLoss = 100
 		return m
 	}
+	m.RemoteAddr = ipAddr.String()
 	conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
 	if err != nil {
 		m.Err = "icmp socket unavailable (needs privilege): " + err.Error()
@@ -326,6 +336,9 @@ func (icmpProber) Probe(ctx context.Context, agentID, peerID, target string, spe
 		return m
 	}
 	defer conn.Close()
+	m.LocalAddr = conn.LocalAddr().String()
+	p4 := conn.IPv4PacketConn()
+	_ = p4.SetControlMessage(ipv4.FlagTTL, true)
 
 	id := os.Getpid() & 0xffff
 	dst := &net.UDPAddr{IP: ipAddr.IP}
@@ -346,12 +359,12 @@ func (icmpProber) Probe(ctx context.Context, agentID, peerID, target string, spe
 		}
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(probeTimeout))
+	_ = p4.SetReadDeadline(time.Now().Add(probeTimeout))
 	seen := make(map[int]bool)
 	var br burstResult
 	rb := make([]byte, 1500)
 	for br.received < probeBurst {
-		n, _, err := conn.ReadFrom(rb)
+		n, cm, _, err := p4.ReadFrom(rb)
 		if err != nil {
 			break
 		}
@@ -370,6 +383,9 @@ func (icmpProber) Probe(ctx context.Context, agentID, peerID, target string, spe
 		seen[echo.Seq] = true
 		br.received++
 		br.rttSumNs += time.Now().UnixNano() - sendNs
+		if cm != nil && m.TTL == 0 {
+			m.TTL = cm.TTL
+		}
 	}
 	br.apply(&m, probeBurst)
 	return m

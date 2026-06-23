@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"netmesh/internal/logging"
+	"netmesh/internal/protocol"
 )
 
 // Responder is the peer-side echo service. Every agent runs one so that peers'
@@ -17,13 +18,12 @@ import (
 // which binds the same port number as its source, can coexist on a host that
 // shares the data-plane port across roles.
 type Responder struct {
-	port int
-	log  *logging.Logger
+	log *logging.Logger
 }
 
-// NewResponder builds a responder bound to the given data-plane port.
-func NewResponder(port int, log *logging.Logger) *Responder {
-	return &Responder{port: port, log: log}
+// NewResponder builds a responder.
+func NewResponder(log *logging.Logger) *Responder {
+	return &Responder{log: log}
 }
 
 // reusePortControl (defined per-platform in reuseport_unix.go /
@@ -31,32 +31,39 @@ func NewResponder(port int, log *logging.Logger) *Responder {
 // symmetric prober can coexist with the responder. It is shared by the
 // responder listeners and the symmetric prober.
 
-// Start launches the UDP and TCP echo servers and blocks until ctx is
-// cancelled, at which point the listeners are closed.
-func (r *Responder) Start(ctx context.Context) error {
-	addr := ":" + itoa(r.port)
+// Serve binds the UDP and TCP echo servers on the given port and serves until
+// ctx is cancelled. It returns a PortStatus describing which protocols bound —
+// the master's port-availability signal. Binding happens before Serve returns;
+// serving continues in the background until ctx is done.
+func (r *Responder) Serve(ctx context.Context, port int) protocol.PortStatus {
+	addr := ":" + itoa(port)
 	lc := net.ListenConfig{Control: reusePortControl}
+	st := protocol.PortStatus{Port: port}
 
-	udpPC, err := lc.ListenPacket(ctx, "udp", addr)
-	if err != nil {
-		return err
+	udpPC, uerr := lc.ListenPacket(ctx, "udp", addr)
+	if uerr == nil {
+		st.UDP = true
+		go r.serveUDP(udpPC)
+		go func() { <-ctx.Done(); udpPC.Close() }()
+	} else {
+		st.Err = "udp: " + uerr.Error()
 	}
-	tcpLn, err := lc.Listen(ctx, "tcp", addr)
-	if err != nil {
-		udpPC.Close()
-		return err
+
+	tcpLn, terr := lc.Listen(ctx, "tcp", addr)
+	if terr == nil {
+		st.TCP = true
+		go r.serveTCP(tcpLn)
+		go func() { <-ctx.Done(); tcpLn.Close() }()
+	} else {
+		if st.Err != "" {
+			st.Err += "; "
+		}
+		st.Err += "tcp: " + terr.Error()
 	}
 
-	r.log.Emit(logging.Event{Type: logging.AgentStarted, Detail: "data-plane responder up",
-		Fields: map[string]any{"dataPort": r.port}})
-
-	go r.serveUDP(udpPC)
-	go r.serveTCP(tcpLn)
-
-	<-ctx.Done()
-	udpPC.Close()
-	tcpLn.Close()
-	return nil
+	r.log.Emit(logging.Event{Type: logging.AgentStarted, Detail: "data-plane responder bound",
+		Fields: map[string]any{"port": port, "udp": st.UDP, "tcp": st.TCP}})
+	return st
 }
 
 // serveUDP echoes every received datagram back to its sender, verbatim.

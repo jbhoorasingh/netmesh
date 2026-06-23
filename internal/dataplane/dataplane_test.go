@@ -56,11 +56,14 @@ func TestBurstResultApply(t *testing.T) {
 func TestResponderUDPEcho(t *testing.T) {
 	port := freeUDPPort(t)
 	log := logging.New("test")
-	r := NewResponder(port, log)
+	r := NewResponder(log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = r.Start(ctx) }()
-	time.Sleep(150 * time.Millisecond) // let the listeners bind
+	st := r.Serve(ctx, port)
+	if !st.UDP {
+		t.Fatalf("responder failed to bind UDP: %s", st.Err)
+	}
+	time.Sleep(100 * time.Millisecond) // let the listeners settle
 
 	target := net.JoinHostPort("127.0.0.1", itoa(port))
 	m := udpProber{symmetric: false}.Probe(ctx, "self", "peer", target, protocol.TestSpec{PayloadSize: 64})
@@ -73,22 +76,31 @@ func TestResponderUDPEcho(t *testing.T) {
 	if m.PacketLoss != 0 {
 		t.Errorf("loss = %.1f, want 0 over loopback", m.PacketLoss)
 	}
+	if m.RemoteAddr == "" || m.LocalAddr == "" {
+		t.Errorf("expected addrs captured, got local=%q remote=%q", m.LocalAddr, m.RemoteAddr)
+	}
 }
 
 // TestResponderTCPEcho verifies the TCP prober completes a payload round trip.
 func TestResponderTCPEcho(t *testing.T) {
 	port := freeUDPPort(t) // any free port; TCP listener will use it too
 	log := logging.New("test")
-	r := NewResponder(port, log)
+	r := NewResponder(log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = r.Start(ctx) }()
-	time.Sleep(150 * time.Millisecond)
+	st := r.Serve(ctx, port)
+	if !st.TCP {
+		t.Fatalf("responder failed to bind TCP: %s", st.Err)
+	}
+	time.Sleep(100 * time.Millisecond)
 
 	target := net.JoinHostPort("127.0.0.1", itoa(port))
 	m := tcpProber{}.Probe(ctx, "self", "peer", target, protocol.TestSpec{PayloadSize: 128})
 	if !m.Success || m.RTTMicros <= 0 {
 		t.Fatalf("tcp echo failed: success=%v err=%q", m.Success, m.Err)
+	}
+	if m.RemoteAddr == "" {
+		t.Errorf("expected RemoteAddr captured")
 	}
 }
 

@@ -16,6 +16,7 @@
   const PORT_FOR = { 'UDP-Sym': 9000, 'UDP-Dyn': 0, 'TCP': 5201, 'ICMP': 0, 'WS': 5999 };
 
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const portFromAddr = (a) => { if (!a) return 0; const i = a.lastIndexOf(':'); return i < 0 ? 0 : (parseInt(a.slice(i + 1), 10) || 0); };
   const pad = (n) => (n < 10 ? '0' : '') + n;
   const timeStr = (ms) => { const d = new Date(ms); return pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()); };
   const colorFor = (s) => s === 'green' ? P.green : s === 'yellow' ? P.yellow : P.red;
@@ -41,6 +42,7 @@
     logMax: false, logPaused: false, logNew: 0,
     logLevels: new Set(['INFO', 'WARN', 'ERR', 'TEST', 'ADMIN']),
     logQuery: '',
+    testSetup: false, testPort: 0,
     structKey: '',
   };
   for (let i = 0; i < 90; i++) { S.hLat.push(0); S.hJit.push(0); S.hLoss.push(0); }
@@ -78,9 +80,9 @@
 
   // ---------- event mapping ----------
   const EVENT_STYLE = {
-    PACKET_SEQUENCE_MISSED: ['ERR', P.red], AGENT_DROPPED: ['ERR', P.red], DIAG_REJECTED: ['ERR', P.red], AUTH_REJECTED: ['ERR', P.red], FLOW_CRITICAL: ['ERR', P.red],
+    PACKET_SEQUENCE_MISSED: ['ERR', P.red], AGENT_DROPPED: ['ERR', P.red], DIAG_REJECTED: ['ERR', P.red], AUTH_REJECTED: ['ERR', P.red], FLOW_CRITICAL: ['ERR', P.red], PORT_UNAVAILABLE: ['ERR', P.red],
     HEARTBEAT_TIMEOUT: ['WARN', P.yellow], WS_RECONNECTING: ['WARN', P.yellow], WS_DISCONNECTED: ['WARN', P.yellow], TELEMETRY_SPOOLED: ['WARN', P.yellow], FLOW_DEGRADED: ['WARN', P.yellow],
-    AGENT_JOINED: ['INFO', P.green], AGENT_REGISTERED: ['INFO', P.green], TELEMETRY_FLUSHED: ['INFO', P.green], WS_CONNECTED: ['INFO', P.green], DIAG_COMPLETED: ['INFO', P.green], FLOW_RECOVERED: ['INFO', P.green], TEST_STARTED: ['INFO', P.green],
+    AGENT_JOINED: ['INFO', P.green], AGENT_REGISTERED: ['INFO', P.green], TELEMETRY_FLUSHED: ['INFO', P.green], WS_CONNECTED: ['INFO', P.green], DIAG_COMPLETED: ['INFO', P.green], FLOW_RECOVERED: ['INFO', P.green], TEST_STARTED: ['INFO', P.green], PORT_BOUND: ['INFO', P.green],
     MESH_SUMMARY: ['TEST', P.accent], TEST_STOPPED: ['INFO', P.yellow], AGENT_CONFIG_UPDATED: ['ADMIN', P.accent], AGENT_EVICTED: ['ADMIN', P.yellow],
   };
   // friendly label lookup (admin-assigned name falls back to agent id)
@@ -138,7 +140,8 @@
       const prof = PROF_DISPLAY[m.profile] || m.profile;
       const rtt = (m.rttUs || 0) / 1000;
       const id = m.agentId + '>' + m.peerId + '/' + m.profile;
-      flows.push({ id, src: m.agentId, dst: m.peerId, profile: prof, port: PORT_FOR[prof] || 0, latency: rtt, jitter: estJit(id, rtt), loss: m.success ? (m.lossPct || 0) : 100, success: m.success, err: m.err, ctrl: false });
+      const port = portFromAddr(m.remoteAddr) || PORT_FOR[prof] || 0;
+      flows.push({ id, src: m.agentId, dst: m.peerId, profile: prof, port, latency: rtt, jitter: estJit(id, rtt), loss: m.success ? (m.lossPct || 0) : 100, success: m.success, err: m.err, ctrl: false, ttl: m.ttl || 0, localAddr: m.localAddr || '', remoteAddr: m.remoteAddr || '' });
     });
     S.flows = flows;
     S.flowById = {}; flows.forEach((f) => S.flowById[f.id] = f);
@@ -181,7 +184,7 @@
 
   // structural render: rebuilt only when the layout (role/page/drawer/diag/auth) changes
   function structureKey() {
-    return [S.info.role, S.page, S.detail ? S.detail.mode : '', !!S.diagOpen, !!S.logMax, readOnly(), S.info.authEnabled && S.info.authenticated, !!S.selectedNode, S.info.role === 'agent' && !infoJoined(), S.running].join('|');
+    return [S.info.role, S.page, S.detail ? S.detail.mode : '', !!S.diagOpen, !!S.logMax, !!S.testSetup, readOnly(), S.info.authEnabled && S.info.authenticated, !!S.selectedNode, S.info.role === 'agent' && !infoJoined(), S.running].join('|');
   }
   function infoJoined() { return S.info.joined || (S.info.master && S.info.master !== ''); }
 
@@ -234,7 +237,7 @@
       </div>
       <div style="width:1px;height:22px;background:#1b2430"></div>
       ${isC ? `${runPill}
-      <button data-act="startTest" ${startDisabled ? 'disabled' : ''} style="${startStyle}">▷ START TEST</button>
+      <button data-act="openTestSetup" ${startDisabled ? 'disabled' : ''} style="${startStyle}">▷ START TEST</button>
       <button data-act="stopTest" ${stopDisabled ? 'disabled' : ''} style="${stopStyle}">▢ STOP</button>
       <div style="width:1px;height:22px;background:#1b2430"></div>` : ''}
       ${auth}
@@ -256,6 +259,36 @@
       ${S.detail && S.page !== 'admin' ? drawerHTML() : ''}
       ${S.diagOpen ? diagHTML() : ''}
       ${S.logMax ? logMaxHTML() : ''}
+      ${S.testSetup ? testSetupHTML() : ''}
+    </div>`;
+  }
+
+  function testSetupHTML() {
+    const ro = readOnly();
+    const PROFS = [['udp_symmetric', 'UDP-Sym'], ['udp_dynamic', 'UDP-Dyn'], ['tcp', 'TCP'], ['icmp', 'ICMP']];
+    return `<div style="position:absolute;inset:0;background:#05070ad9;backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:55">
+      <div id="nm-test-setup" style="width:460px;max-width:calc(100% - 36px);background:linear-gradient(180deg,#10161f,#0b0f15);border:1px solid #233044;border-radius:12px;box-shadow:0 30px 80px #000c;padding:24px;animation:nm-rise .2s ease">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+          <div style="width:28px;height:28px;border-radius:7px;background:linear-gradient(135deg,#1f6feb,#0b3a8a);display:flex;align-items:center;justify-content:center;color:#cfe0ff">▷</div>
+          <div style="font:700 15px 'IBM Plex Sans';color:#eef3fa">Set up data-plane test</div>
+          <div style="flex:1"></div>
+          <button data-act="closeTestSetup" style="background:transparent;border:none;color:#6b7888;font-size:16px;cursor:pointer">✕</button>
+        </div>
+
+        <div style="font:600 9px 'IBM Plex Mono';letter-spacing:.13em;color:#5d6a7c;margin-bottom:6px">DATA-PLANE PORT</div>
+        <input id="nm-test-port" type="number" min="0" max="65535" value="${S.testPort || ''}" placeholder="0 = each agent's default data port" style="width:100%;background:#0a0e14;border:1px solid #233044;border-radius:7px;color:#eef3fa;font:500 13px 'IBM Plex Mono';padding:10px 12px;outline:none;margin-bottom:4px"/>
+        <div style="font:500 9px 'IBM Plex Mono';color:#465061;margin-bottom:16px">agents bind this port and probe each other on it; <b style="color:#7b8898">0</b> uses each agent's own data port</div>
+
+        <div style="font:600 9px 'IBM Plex Mono';letter-spacing:.13em;color:#5d6a7c;margin-bottom:7px">TRAFFIC PROFILES</div>
+        <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:16px">
+          ${PROFS.map(([p, lbl]) => `<label style="display:inline-flex;align-items:center;gap:5px;font:500 11px 'IBM Plex Mono';color:#9fb1c6;background:#0a0e14;border:1px solid #1c2632;border-radius:6px;padding:7px 10px;cursor:pointer"><input type="checkbox" class="nm-test-proto" data-prof="${p}" ${(!S.testProtocols || S.testProtocols.has(p)) ? 'checked' : ''}/>${lbl}</label>`).join('')}
+        </div>
+
+        <div style="font:600 9px 'IBM Plex Mono';letter-spacing:.13em;color:#5d6a7c;margin-bottom:6px">TX INTERVAL (ms)</div>
+        <input id="nm-test-interval" type="number" min="50" max="5000" value="${S.txInterval}" style="width:100%;background:#0a0e14;border:1px solid #233044;border-radius:7px;color:#eef3fa;font:500 13px 'IBM Plex Mono';padding:10px 12px;outline:none;margin-bottom:18px"/>
+
+        <button data-act="runTest" ${ro ? 'disabled' : ''} style="width:100%;font:600 13px 'IBM Plex Sans';color:#fff;background:${ro ? '#1c2632' : '#1f6feb'};border:none;padding:12px;border-radius:8px;cursor:${ro ? 'not-allowed' : 'pointer'};box-shadow:0 4px 16px #1f6feb55">▷ Start test</button>
+      </div>
     </div>`;
   }
 
@@ -505,7 +538,7 @@
         <td style="padding:7px 10px"><input class="nm-label" value="${esc(a.label || '')}" placeholder="${esc(a.id)}" style="background:#0a0e14;border:1px solid #1c2632;border-radius:5px;color:#eef3fa;font:500 11px 'IBM Plex Mono';padding:6px 8px;width:140px;outline:none"/></td>
         <td style="padding:7px 10px;color:#8b98a8;white-space:nowrap">${esc(a.id)}</td>
         <td style="padding:7px 10px"><input class="nm-group" value="${esc(a.group || '')}" placeholder="—" style="background:#0a0e14;border:1px solid #1c2632;border-radius:5px;color:#cdd9e5;font:500 11px 'IBM Plex Mono';padding:6px 8px;width:84px;outline:none"/></td>
-        <td style="padding:7px 10px;color:#7b8898">${a.dataPort || '—'}</td>
+        <td style="padding:7px 10px;color:#7b8898">${a.dataPort || '—'}${a.testPort ? `<span title="active test port: UDP ${a.portUdp ? 'ok' : 'fail'} / TCP ${a.portTcp ? 'ok' : 'fail'}" style="margin-left:7px;font-size:10px;color:${a.portUdp && a.portTcp ? '#7ee787' : '#d29922'}">▸${a.testPort} ${a.portUdp && a.portTcp ? '✓' : '!'}</span>` : ''}</td>
         <td style="padding:7px 10px;color:#cdd9e5">${((a.wsRttUs || 0) / 1000).toFixed(1)}ms</td>
         <td style="padding:7px 10px"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:${enabled ? colorFor(s) : '#566273'}"><input type="checkbox" class="nm-enabled" ${enabled ? 'checked' : ''}/><span style="width:6px;height:6px;border-radius:50%;background:${enabled ? colorFor(s) : '#3a4757'};${enabled ? 'box-shadow:0 0 5px ' + colorFor(s) : ''}"></span>${enabled ? 'enabled' : 'disabled'}</label></td>
         <td style="padding:7px 10px;white-space:nowrap">${profBoxes}</td>
@@ -806,6 +839,7 @@
         ${miniStat('WS LATENCY', lat.toFixed(1), ' ms')}${miniStat('LOSS', loss.toFixed(2), ' %')}${miniStat('TESTS', dp.length, '')}
         ${miniStat('FRAMES RX', a ? a.framesRx || 0 : 0, '')}${miniStat('FRAMES TX', a ? a.framesTx || 0 : 0, '')}${miniStat('LAST SEQ', a ? a.lastSeq || 0 : 0, '')}
       </div>
+      ${a && a.testPort ? `<div style="flex:0 0 auto;padding:0 16px 10px"><div style="display:flex;align-items:center;gap:8px;background:#0e141d;border:1px solid #1a2330;border-radius:7px;padding:9px 11px;font:500 10px 'IBM Plex Mono'"><span style="color:#5d6a7c;letter-spacing:.08em">DATA-PLANE PORT</span><b style="color:#cdd9e5">${a.testPort}</b><div style="flex:1"></div><span style="color:${a.portUdp ? '#7ee787' : '#f85149'}">UDP ${a.portUdp ? '✓' : '✕'}</span><span style="color:${a.portTcp ? '#7ee787' : '#f85149'}">TCP ${a.portTcp ? '✓' : '✕'}</span></div></div>` : ''}
       <div style="flex:0 0 auto;padding:4px 16px 8px;font:600 9px 'IBM Plex Mono';letter-spacing:.12em;color:#5d6a7c">TESTS &amp; FLOWS — click for probe detail</div>
       <div style="flex:1;min-height:0;overflow:auto;padding:0 12px 12px">
         ${flows.map((f) => { const st = statusOf(f.latency, f.loss); const pm = PROF[f.profile] || ['#8b98a8', '#8b98a844']; const peer = f.ctrl ? 'controller' : (f.src === id ? f.dst : f.src); const dir = f.ctrl ? 'WS·CTRL' : (f.src === id ? 'OUT →' : '← IN'); return `<button data-act="openTest" data-arg="${esc(f.id)}" style="width:100%;text-align:left;display:flex;align-items:center;gap:10px;background:#0d131c;border:1px solid #18212d;border-radius:7px;padding:9px 11px;margin-bottom:6px"><span style="font:600 8px 'IBM Plex Mono';color:${f.ctrl ? P.accent : '#7b8898'};width:42px;flex:0 0 auto">${dir}</span><span style="font:600 11px 'IBM Plex Mono';color:#cdd9e5;flex:1;min-width:0">${esc(peer)}</span><span style="color:${pm[0]};border:1px solid ${pm[1]};padding:1px 6px;border-radius:4px;font:500 9px 'IBM Plex Mono'">${esc(f.profile)}</span><span style="font:500 10px 'IBM Plex Mono';color:#8b98a8;width:50px;text-align:right">${f.latency.toFixed(1)}ms</span><span style="width:7px;height:7px;border-radius:50%;background:${colorFor(st)};box-shadow:0 0 5px ${colorFor(st)};flex:0 0 auto"></span><span style="color:#465061;font-size:13px">›</span></button>`; }).join('')}
@@ -829,6 +863,16 @@
       <div style="flex:0 0 auto;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:12px 16px">
         ${miniStat('LATENCY', r.latency.toFixed(1), ' ms')}${miniStat('JITTER', (r.jitter || 0).toFixed(2), ' ms')}${miniStat('LOST', lostPct.toFixed(1), ' %')}
         ${miniStat('SENT', ts.sent, '')}${miniStat('MISSED', ts.missed, '')}${miniStat('REORDERED', ts.reord, '')}
+      </div>
+      <div style="flex:0 0 auto;padding:0 16px 12px">
+        <div style="font:600 9px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c;margin-bottom:6px">IP HEADER / SOCKET</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;font:500 10px 'IBM Plex Mono'">
+          <span style="background:#0e141d;border:1px solid #1a2330;border-radius:5px;padding:5px 9px;color:#cdd9e5">ttl <b style="color:${r.ttl ? '#7ee787' : '#566273'}">${r.ttl || '—'}</b></span>
+          <span style="background:#0e141d;border:1px solid #1a2330;border-radius:5px;padding:5px 9px;color:#8b98a8">src <b style="color:#cdd9e5">${esc(r.localAddr || '—')}</b></span>
+          <span style="color:#465061;align-self:center">→</span>
+          <span style="background:#0e141d;border:1px solid #1a2330;border-radius:5px;padding:5px 9px;color:#8b98a8">dst <b style="color:#cdd9e5">${esc(r.remoteAddr || '—')}</b></span>
+        </div>
+        ${r.profile === 'TCP' ? `<div style="font:500 9px 'IBM Plex Mono';color:#465061;margin-top:5px">ttl not exposed for TCP by the OS socket API</div>` : ''}
       </div>
       <div style="flex:0 0 auto;padding:0 16px 10px"><div style="font:600 9px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c;margin-bottom:6px">PACKET SEQUENCE · recent probes</div><div style="display:flex;gap:2px;align-items:flex-end;height:20px">${buf.slice(-46).map((x) => `<span style="flex:1;height:20px;border-radius:2px;background:${colorFor(x === 'MISS' ? 'red' : x === 'REORD' ? 'yellow' : 'green')}"></span>`).join('')}</div></div>
       <div style="flex:0 0 auto;padding:0 16px 6px;font:600 9px 'IBM Plex Mono';letter-spacing:.1em;color:#5d6a7c">PROBE MESSAGES · live</div>
@@ -963,7 +1007,17 @@
       if (!r.ok) { alert('Evict failed: ' + (await r.text())); return; }
       setTimeout(async () => { await refresh(); updateAdminRows(); }, 700);
     },
-    startTest: async () => { if (readOnly()) return loginPrompt(); if (S.running) return; const r = await postJSON('/api/tests/start', { intervalMs: S.txInterval }); if (r.ok) setRunning(true); },
+    openTestSetup: () => { if (readOnly()) return loginPrompt(); if (S.running) return; S.testSetup = true; render(); },
+    closeTestSetup: () => { S.testSetup = false; render(); },
+    runTest: async () => {
+      if (readOnly()) return loginPrompt();
+      const port = parseInt((document.getElementById('nm-test-port') || {}).value || '0', 10) || 0;
+      const interval = parseInt((document.getElementById('nm-test-interval') || {}).value || S.txInterval, 10) || S.txInterval;
+      const protocols = [...document.querySelectorAll('.nm-test-proto')].filter((c) => c.checked).map((c) => c.getAttribute('data-prof'));
+      S.txInterval = interval; S.testPort = port;
+      const r = await postJSON('/api/tests/start', { port, protocols, intervalMs: interval });
+      if (r.ok) { S.testSetup = false; S.running = true; render(); } else { alert('Start failed: ' + (await r.text())); }
+    },
     stopTest: async () => { if (readOnly()) return loginPrompt(); if (!S.running) return; const r = await postJSON('/api/tests/stop', {}); if (r.ok) setRunning(false); },
     setTx: (e) => { S.txInterval = +e.target.value; updateClock(); },
     setQuery: (e) => { S.query = e.target.value; updateGrid(); },

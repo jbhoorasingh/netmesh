@@ -163,6 +163,25 @@ runs a **Responder** — UDP and TCP echo servers on its data-plane port
 
 Each probe sends a small burst (4 packets) and reports average RTT and loss %.
 
+**Master-driven test setup.** From the Controller you choose the **data-plane
+port** and which **protocols** to run (the *Set up data-plane test* dialog behind
+START TEST, or `POST /api/tests/start {"port":9100,"protocols":["tcp","icmp"],"intervalMs":400}`).
+A non-zero port is applied mesh-wide — agents bind that port for their responder
+and probe each other on it; `0` falls back to each agent's own data port. The
+selection is intersected with each agent's admin-configured profiles.
+
+**Port-availability feedback.** When a test starts, each agent tries to bind the
+chosen port and reports a `PORT_STATUS` back to the master (UDP/TCP bound or not),
+surfaced as `PORT_BOUND` / `PORT_UNAVAILABLE` events, on `/api/agents`
+(`testPort`/`portUdp`/`portTcp`), and in the node-detail drawer.
+
+**IP header.** Each metric carries the observed source/destination address and
+the received **TTL** (hop limit), read via IPv4 control messages for ICMP and
+UDP. The probe-detail drawer shows an *IP HEADER / SOCKET* line, e.g.
+`ttl 64 · src 0.0.0.0:9100 → dst 10.0.0.2:9100` — which also makes the symmetric
+`src port == dst port` visible. (Go's socket API doesn't expose received TTL for
+TCP, so TCP shows addresses only.)
+
 > **UDP-symmetric single-host caveat:** "source port == destination port" makes
 > the source and destination endpoints identical when every agent shares one
 > loopback IP (`127.0.0.1`), which is degenerate. The binding is correct for the

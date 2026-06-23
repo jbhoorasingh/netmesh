@@ -46,6 +46,9 @@ type Agent struct {
 	mu      sync.RWMutex
 	routing protocol.RoutingTable
 	ctx     context.Context // base context for engine/diag work
+
+	respMu     sync.Mutex
+	respCancel context.CancelFunc // cancels the current responder binding
 }
 
 // New constructs an Agent.
@@ -61,7 +64,7 @@ func New(cfg *config.Config, log *logging.Logger) *Agent {
 	// The engine submits metrics to the agent, which tees them to the wire (via
 	// the client) and to the local UI store/stream.
 	a.engine = dataplane.NewEngine(cfg.AgentID, a, log)
-	a.responder = dataplane.NewResponder(cfg.DataPort, log)
+	a.responder = dataplane.NewResponder(log)
 	return a
 }
 
@@ -94,11 +97,9 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	go a.client.Run(ctx)
 	go a.pumpEventsToUI(ctx)
-	go func() {
-		if err := a.responder.Start(ctx); err != nil {
-			a.log.Errorf("agent: data-plane responder failed", "err", err, "dataPort", a.cfg.DataPort)
-		}
-	}()
+	// Bind the responder on the default data port as a baseline; a test may
+	// rebind it to a master-chosen port.
+	a.bindResponder(ctx, a.cfg.DataPort)
 
 	srv := &http.Server{
 		Addr:              a.cfg.ListenAddr(),
@@ -157,10 +158,21 @@ func (a *Agent) onControl(env protocol.Envelope, out transport.Sender) {
 			a.log.Warnf("agent: bad test spec", "err", err)
 			return
 		}
+		// Bind the responder on the master-chosen port and report availability.
+		port := spec.Port
+		if port <= 0 {
+			port = a.cfg.DataPort
+		}
+		status := a.bindResponder(a.baseCtx(), port)
+		status.AgentID = a.cfg.AgentID
+		if err := out.Send(protocol.TypePortStatus, status); err != nil {
+			a.log.Warnf("agent: port status send failed", "err", err)
+		}
 		a.engine.Start(a.baseCtx(), a.currentRouting(), spec)
 
 	case protocol.TypeTestStop:
 		a.engine.Stop()
+		a.bindResponder(a.baseCtx(), a.cfg.DataPort) // return to the baseline port
 
 	case protocol.TypeDiagRequest:
 		var req protocol.DiagRequest
@@ -202,6 +214,20 @@ func (a *Agent) currentRouting() protocol.RoutingTable {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.routing
+}
+
+// bindResponder (re)binds the data-plane echo responder to port, cancelling any
+// previous binding, and returns the resulting port-availability status. Serving
+// continues in the background until the next rebind or until parent is done.
+func (a *Agent) bindResponder(parent context.Context, port int) protocol.PortStatus {
+	a.respMu.Lock()
+	if a.respCancel != nil {
+		a.respCancel()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	a.respCancel = cancel
+	a.respMu.Unlock()
+	return a.responder.Serve(ctx, port)
 }
 
 func (a *Agent) pumpEventsToUI(ctx context.Context) {

@@ -29,6 +29,8 @@ const (
 	HeartbeatTimeout     EventType = "HEARTBEAT_TIMEOUT"
 	TestStarted          EventType = "TEST_STARTED"
 	TestStopped          EventType = "TEST_STOPPED"
+	PortBound            EventType = "PORT_BOUND"
+	PortUnavailable      EventType = "PORT_UNAVAILABLE"
 	RoutingUpdated       EventType = "ROUTING_UPDATED"
 	MeshSummary          EventType = "MESH_SUMMARY"
 	FlowDegraded         EventType = "FLOW_DEGRADED"

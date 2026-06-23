@@ -18,10 +18,11 @@ type MessageType string
 
 const (
 	// Control plane: agent -> controller.
-	TypeRegister  MessageType = "REGISTER"  // agent announces itself on (re)connect
-	TypeTelemetry MessageType = "TELEMETRY" // batch of probe metrics
-	TypeDiagChunk MessageType = "DIAG_CHUNK"
-	TypeEvent     MessageType = "EVENT" // agent-sourced structured event
+	TypeRegister   MessageType = "REGISTER"  // agent announces itself on (re)connect
+	TypeTelemetry  MessageType = "TELEMETRY" // batch of probe metrics
+	TypeDiagChunk  MessageType = "DIAG_CHUNK"
+	TypeEvent      MessageType = "EVENT"       // agent-sourced structured event
+	TypePortStatus MessageType = "PORT_STATUS" // agent reports test-port bind availability
 
 	// Control plane: controller -> agent.
 	TypeRegisterAck MessageType = "REGISTER_ACK"
@@ -112,6 +113,17 @@ type TestSpec struct {
 	IntervalMS  int64  `json:"intervalMs"`  // probe cadence per profile
 	PayloadSize int    `json:"payloadSize"` // bytes
 	Count       int    `json:"count"`       // 0 == run until TestStop
+	Port        int    `json:"port"`        // data-plane port to bind/probe (0 == agent default)
+}
+
+// PortStatus is an agent's report of whether it could bind the test port for
+// the data-plane responder — the master's port-availability validation.
+type PortStatus struct {
+	AgentID string `json:"agentId"`
+	Port    int    `json:"port"`
+	UDP     bool   `json:"udp"` // UDP bind succeeded
+	TCP     bool   `json:"tcp"` // TCP bind succeeded
+	Err     string `json:"err,omitempty"`
 }
 
 // DiagRequest is a Controller-initiated diagnostic command. Only whitelisted

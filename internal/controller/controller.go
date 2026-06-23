@@ -51,6 +51,10 @@ type Controller struct {
 
 	running     atomic.Bool  // whether a test is currently active
 	curInterval atomic.Int64 // interval of the active test (for re-applying config)
+	curPort     atomic.Int64 // data-plane port of the active test
+
+	curMu        sync.Mutex
+	curProtocols []protocol.Profile // protocols of the active test
 
 	flowMu       sync.Mutex
 	flowStatus   map[string]string // last emitted status per flow (for transition events)
@@ -234,7 +238,7 @@ func (c *Controller) handleAdminUpdate(w http.ResponseWriter, r *http.Request) {
 		Detail: adminDetail(cfg), Fields: map[string]any{"enabled": cfg.Enabled, "label": cfg.Label, "group": cfg.Group}})
 	// If a test is live, re-apply so enable/disable and profile changes take effect now.
 	if c.running.Load() {
-		c.startMesh(c.curInterval.Load())
+		c.startMesh(c.curInterval.Load(), int(c.curPort.Load()), c.currentProtocols())
 	}
 	writeJSON(w, http.StatusOK, cfg)
 }
@@ -278,11 +282,16 @@ func (c *Controller) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 // startRequest is the (optional) body for POST /api/tests/start. With no body,
-// the controller auto-builds a full mesh across the connected agents.
+// the controller auto-builds a full mesh across the connected agents using each
+// agent's default data port and configured profiles.
 type startRequest struct {
 	Routing    protocol.RoutingTable `json:"routing"`
 	Spec       protocol.TestSpec     `json:"spec"`
 	IntervalMS int64                 `json:"intervalMs"`
+	// Master-driven test setup: the data-plane port to bind/probe (0 = each
+	// agent's default), and which protocols to run (empty = per-agent config).
+	Port      int                `json:"port"`
+	Protocols []protocol.Profile `json:"protocols"`
 }
 
 func (c *Controller) handleTestStart(w http.ResponseWriter, r *http.Request) {
@@ -316,11 +325,11 @@ func (c *Controller) handleTestStart(w http.ResponseWriter, r *http.Request) {
 		c.hub.Broadcast(protocol.TypeTestStart, req.Spec)
 		runID, agents = req.Spec.RunID, len(req.Routing.Peers)
 	} else {
-		runID, agents = c.startMesh(interval)
+		runID, agents = c.startMesh(interval, req.Port, req.Protocols)
 	}
 
 	c.log.Emit(logging.Event{Type: logging.TestStarted, Detail: runID,
-		Fields: map[string]any{"intervalMs": interval, "agents": agents}})
+		Fields: map[string]any{"intervalMs": interval, "agents": agents, "port": req.Port}})
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "started", "runId": runID, "agents": agents})
 }
 
@@ -328,11 +337,17 @@ func (c *Controller) handleTestStart(w http.ResponseWriter, r *http.Request) {
 // agents (probed with that agent's configured profiles) plus a TEST_START.
 // Disabled agents are told to stop. Returns the run id and number of agents
 // started. It is also called to re-apply config changes mid-run.
-func (c *Controller) startMesh(intervalMs int64) (string, int) {
+func (c *Controller) startMesh(intervalMs int64, port int, protocols []protocol.Profile) (string, int) {
+	// Remember the test config so an admin change can re-apply it mid-run.
+	c.curPort.Store(int64(port))
+	c.setProtocols(protocols)
+
 	runID := "run-" + time.Now().Format("150405")
-	spec := protocol.TestSpec{RunID: runID, IntervalMS: intervalMs, PayloadSize: 64}
+	spec := protocol.TestSpec{RunID: runID, IntervalMS: intervalMs, PayloadSize: 64, Port: port}
 	epoch := uint64(time.Now().Unix())
 
+	// Resolve a dialable address per enabled agent: a master-chosen port applies
+	// mesh-wide; otherwise each agent's own advertised data port is used.
 	type addr struct{ id, address string }
 	infos := c.hub.Agents()
 	var enabled []addr
@@ -344,32 +359,66 @@ func (c *Controller) startMesh(intervalMs int64) (string, int) {
 		if err != nil {
 			host = a.RemoteAddr
 		}
-		dp := a.DataPort
-		if dp == 0 {
-			dp = c.cfg.Port + 1
+		p := port
+		if p <= 0 {
+			if p = a.DataPort; p == 0 {
+				p = c.cfg.Port + 1
+			}
 		}
-		enabled = append(enabled, addr{a.ID, net.JoinHostPort(host, strconv.Itoa(dp))})
+		enabled = append(enabled, addr{a.ID, net.JoinHostPort(host, strconv.Itoa(p))})
 	}
 
 	started := 0
 	for _, a := range infos {
 		cfg := c.admin.get(a.ID)
-		if !cfg.Enabled || len(cfg.Profiles) == 0 {
+		profiles := intersectProfiles(protocols, cfg.Profiles)
+		if !cfg.Enabled || len(profiles) == 0 {
 			_ = c.hub.SendTo(a.ID, protocol.TypeTestStop, nil)
 			continue
 		}
 		peers := make([]protocol.Peer, 0, len(enabled))
-		for _, p := range enabled {
-			if p.id == a.ID {
+		for _, pa := range enabled {
+			if pa.id == a.ID {
 				continue
 			}
-			peers = append(peers, protocol.Peer{AgentID: p.id, Address: p.address, Profiles: cfg.Profiles})
+			peers = append(peers, protocol.Peer{AgentID: pa.id, Address: pa.address, Profiles: profiles})
 		}
 		_ = c.hub.SendTo(a.ID, protocol.TypeRouting, protocol.RoutingTable{Epoch: epoch, Peers: peers})
 		_ = c.hub.SendTo(a.ID, protocol.TypeTestStart, spec)
 		started++
 	}
 	return runID, started
+}
+
+// intersectProfiles restricts the test-selected protocols to those an agent is
+// configured to run. An empty selection means "all the agent's profiles".
+func intersectProfiles(selected, agentProfiles []protocol.Profile) []protocol.Profile {
+	if len(selected) == 0 {
+		return agentProfiles
+	}
+	allow := make(map[protocol.Profile]bool, len(agentProfiles))
+	for _, p := range agentProfiles {
+		allow[p] = true
+	}
+	out := make([]protocol.Profile, 0, len(selected))
+	for _, p := range selected {
+		if allow[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (c *Controller) setProtocols(p []protocol.Profile) {
+	c.curMu.Lock()
+	c.curProtocols = p
+	c.curMu.Unlock()
+}
+
+func (c *Controller) currentProtocols() []protocol.Profile {
+	c.curMu.Lock()
+	defer c.curMu.Unlock()
+	return c.curProtocols
 }
 
 func (c *Controller) handleTestStop(w http.ResponseWriter, r *http.Request) {

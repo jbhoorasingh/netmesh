@@ -45,8 +45,13 @@ type Metric struct {
 	Success    bool    `json:"success"`
 	RTTMicros  int64   `json:"rttUs"`   // round-trip time in microseconds (0 on failure)
 	PacketLoss float64 `json:"lossPct"` // 0..100 for multi-packet probes
-	TTL        int     `json:"ttl,omitempty"`
-	Err        string  `json:"err,omitempty"`
+
+	// IP-header / socket detail observed for the probe.
+	TTL        int    `json:"ttl,omitempty"`        // received hop limit (ICMP/UDP echo reply)
+	LocalAddr  string `json:"localAddr,omitempty"`  // observed source ip:port
+	RemoteAddr string `json:"remoteAddr,omitempty"` // observed destination ip:port
+
+	Err string `json:"err,omitempty"`
 }
 
 // TelemetryBatch is the payload of a TELEMETRY envelope: an ordered run of
